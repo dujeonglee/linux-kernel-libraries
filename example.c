@@ -98,6 +98,6 @@ module_init(watchdog_example_init);
 module_exit(watchdog_example_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Dujeong Lee");
+MODULE_AUTHOR("Dujeong Lee <dujeong.lee82@gmail.com>");
 MODULE_DESCRIPTION("Watchdog Library Example");
 MODULE_VERSION("1.0");
