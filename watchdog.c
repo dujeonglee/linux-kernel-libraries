@@ -19,7 +19,7 @@
  * - Accuracy: Adaptive periods ensure precise timeout detection
  * - Simplicity: Automatic period management, no user tuning needed
  *
- * Copyright (C) 2025 Your Name
+ * Copyright (C) 2025 Dujeong Lee <dujeong.lee82@gmail.com>
  */
 
 #include "kernel_watchdog.h"
