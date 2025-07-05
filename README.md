@@ -119,10 +119,10 @@ Start/stop timeout monitoring. These operations are lock-free for maximum perfor
 ### Start-Once Semantics
 
 ```c
-watchdog_start(wd);    // Sets timeout baseline
+watchdog_start(wd);    // Sets timeout baseline at time T
 // ... 200ms later
 watchdog_start(wd);    // Ignored - timeout not extended
-// Timeout still occurs at original time + 1000ms
+// Timeout occurs at T + timeout_ms (not extended by 200ms)
 ```
 
 To restart timeout monitoring:
@@ -143,7 +143,7 @@ watchdog_add(30000, func2, data);  // 30 second timeout
 
 // Scenario 2: Short timeout added
 watchdog_add(200, func3, data);    // 200ms timeout
-// → Work period: automatically adjusted to 50ms (accurate)
+// → Work period: 100ms (200ms/2), but clamped to minimum 50ms = 100ms
 
 // Scenario 3: Short timeout removed
 watchdog_remove(short_item);
