@@ -1,9 +1,9 @@
 #include "monitor.h"
 
 /**
- * monitor_state_changed_with_hysteresis - Check if monitor state has changed with hysteresis
- * @item: monitor item to check
- * @new_state: new state value returned by monitor function
+ * monitor_state_changed_with_hysteresis() - Check if monitor state has changed with hysteresis
+ * @item: Monitor item to check
+ * @new_state: New state value returned by monitor function
  *
  * This function implements hysteresis based on consecutive count mechanism.
  * State change is recognized only when the new state value appears 
@@ -23,31 +23,31 @@
 static bool monitor_state_changed_with_hysteresis(struct monitor_item *item, 
                                                   unsigned long new_state)
 {
-    /* 히스테리시스가 0이면 즉시 변화로 인정 */
+    /* No hysteresis - immediate change recognition */
     if (item->hysteresis == 0) {
         return item->last_action_state != new_state;
     }
     
-    /* 현재 상태와 동일하면 변화 없음 */
+    /* No change from last action state */
     if (item->last_action_state == new_state) {
         item->consecutive_count = 0;
         item->candidate_state = new_state;
         return false;
     }
     
-    /* 후보 상태와 동일한지 확인 */
+    /* Check if this matches the candidate state */
     if (item->candidate_state == new_state) {
         item->consecutive_count++;
         monitor_debug("Item %s: consecutive count %lu for state %lu (need %lu)",
                      item->name, item->consecutive_count, new_state, item->hysteresis);
         
-        /* 히스테리시스 조건 만족 시 상태 변화로 인정 */
+        /* Hysteresis threshold reached - trigger action */
         if (item->consecutive_count >= item->hysteresis) {
             item->consecutive_count = 0;
             return true;
         }
     } else {
-        /* 새로운 후보 상태 */
+        /* New candidate state - reset counter */
         item->candidate_state = new_state;
         item->consecutive_count = 1;
         monitor_debug("Item %s: new candidate state %lu (count 1, need %lu)",
@@ -57,7 +57,21 @@ static bool monitor_state_changed_with_hysteresis(struct monitor_item *item,
     return false;
 }
 
-/* 모니터 워크 함수 */
+/**
+ * monitor_work_func() - Monitor work queue function
+ * @work: Work structure embedded in delayed_work
+ *
+ * This is the main monitoring function that runs periodically via workqueue.
+ * It iterates through all monitor items and checks their states according
+ * to their individual intervals. When a state change is detected (considering
+ * hysteresis), the corresponding action function is called.
+ *
+ * The function temporarily releases the spinlock when calling action functions
+ * to allow them to sleep if needed. This means the item list could potentially
+ * change during action execution, so we recheck the manager state.
+ *
+ * Context: Workqueue context (process context, can sleep)
+ */
 static void monitor_work_func(struct work_struct *work)
 {
     struct monitor_manager *mgr = container_of(work, struct monitor_manager, work.work);
@@ -71,15 +85,15 @@ static void monitor_work_func(struct work_struct *work)
     
     spin_lock_irqsave(&mgr->lock, flags);
     
-    /* 모든 모니터 아이템 순회 */
+    /* Iterate through all monitor items */
     list_for_each_entry_safe(item, tmp, &mgr->item_list, list) {
-        /* 아이템의 주기가 되었는지 확인 */
+        /* Check if it's time to monitor this item */
         if (time_after(current_time, item->last_check_time + 
                       msecs_to_jiffies(item->interval_ms))) {
             
             unsigned long new_state;
             
-            /* 모니터 함수 호출 */
+            /* Call monitor function */
             if (item->monitor_func) {
                 new_state = item->monitor_func(item->private_data);
                 item->check_count++;
@@ -88,11 +102,11 @@ static void monitor_work_func(struct work_struct *work)
                 monitor_debug("Item %s: state %lu -> %lu", 
                              item->name, item->current_state, new_state);
                 
-                /* 히스테리시스를 적용하여 상태 변화 확인 */
+                /* Check for state change with hysteresis */
                 if (monitor_state_changed_with_hysteresis(item, new_state)) {
-                    /* 상태가 변경되었으므로 액션 함수 호출 */
+                    /* State changed - call action function */
                     if (item->action_func) {
-                        /* 스핀락 해제 후 액션 함수 호출 (액션 함수에서 슬립 가능) */
+                        /* Release spinlock before calling action (may sleep) */
                         spin_unlock_irqrestore(&mgr->lock, flags);
                         
                         monitor_debug("Item %s: executing action, state change %lu -> %lu",
@@ -102,7 +116,7 @@ static void monitor_work_func(struct work_struct *work)
                         
                         spin_lock_irqsave(&mgr->lock, flags);
                         
-                        /* 리스트가 변경되었을 수 있으므로 다시 확인 */
+                        /* List might have changed - recheck manager state */
                         if (!mgr->running) {
                             spin_unlock_irqrestore(&mgr->lock, flags);
                             return;
@@ -122,13 +136,25 @@ static void monitor_work_func(struct work_struct *work)
     
     spin_unlock_irqrestore(&mgr->lock, flags);
     
-    /* 다음 주기에 다시 실행되도록 스케줄 */
+    /* Schedule next execution */
     if (mgr->running) {
         schedule_delayed_work(&mgr->work, msecs_to_jiffies(mgr->base_interval_ms));
     }
 }
 
-/* 모니터 매니저 초기화 */
+/**
+ * monitor_manager_init() - Initialize monitor manager
+ * @mgr: Pointer to monitor manager structure
+ * @base_interval_ms: Base monitoring interval in milliseconds
+ *
+ * Initializes all components of the monitor manager including the item list,
+ * delayed work structure, and spinlock. Sets the base interval which will be
+ * used as the minimum monitoring interval and work scheduling interval.
+ * If base_interval_ms is 0, uses DEFAULT_MONITOR_INTERVAL_MS.
+ *
+ * Context: Process context
+ * Return: 0 on success, -EINVAL if mgr is NULL
+ */
 int monitor_manager_init(struct monitor_manager *mgr, unsigned long base_interval_ms)
 {
     if (!mgr) {
@@ -151,7 +177,16 @@ int monitor_manager_init(struct monitor_manager *mgr, unsigned long base_interva
     return 0;
 }
 
-/* 모니터 매니저 정리 */
+/**
+ * monitor_manager_cleanup() - Clean up monitor manager
+ * @mgr: Pointer to monitor manager structure
+ *
+ * Stops monitoring if active and frees all resources associated with the
+ * manager. All monitor items in the list are removed and freed. After
+ * cleanup, the manager must be reinitialized before use.
+ *
+ * Context: Process context
+ */
 void monitor_manager_cleanup(struct monitor_manager *mgr)
 {
     struct monitor_item *item, *tmp;
@@ -161,10 +196,10 @@ void monitor_manager_cleanup(struct monitor_manager *mgr)
         return;
     }
     
-    /* 모니터 정지 */
+    /* Stop monitoring */
     monitor_stop(mgr);
     
-    /* 모든 아이템 제거 */
+    /* Remove and free all items */
     spin_lock_irqsave(&mgr->lock, flags);
     list_for_each_entry_safe(item, tmp, &mgr->item_list, list) {
         list_del(&item->list);
@@ -177,7 +212,17 @@ void monitor_manager_cleanup(struct monitor_manager *mgr)
     monitor_info("Monitor manager cleaned up");
 }
 
-/* 모니터 시작 */
+/**
+ * monitor_start() - Start monitoring
+ * @mgr: Pointer to monitor manager structure
+ *
+ * Starts the periodic monitoring by scheduling the delayed work. The work
+ * will run at intervals specified by base_interval_ms and check all items
+ * according to their individual intervals.
+ *
+ * Context: Process context
+ * Return: 0 on success, -EINVAL if manager is invalid, -EALREADY if already running
+ */
 int monitor_start(struct monitor_manager *mgr)
 {
     if (!mgr || !mgr->initialized) {
@@ -195,7 +240,16 @@ int monitor_start(struct monitor_manager *mgr)
     return 0;
 }
 
-/* 모니터 정지 */
+/**
+ * monitor_stop() - Stop monitoring
+ * @mgr: Pointer to monitor manager structure
+ *
+ * Stops the periodic monitoring by setting the running flag to false and
+ * canceling any pending work. Uses cancel_delayed_work_sync() to ensure
+ * the work function completes before returning.
+ *
+ * Context: Process context (may sleep during work cancellation)
+ */
 void monitor_stop(struct monitor_manager *mgr)
 {
     if (!mgr || !mgr->initialized) {
@@ -208,7 +262,22 @@ void monitor_stop(struct monitor_manager *mgr)
     monitor_info("Monitor stopped");
 }
 
-/* 모니터 아이템 추가 */
+/**
+ * monitor_add_item() - Add a monitor item
+ * @mgr: Pointer to monitor manager structure
+ * @init: Pointer to initialization structure containing item parameters
+ *
+ * Creates a new monitor item with the specified configuration and adds it
+ * to the manager's item list. The item will be included in monitoring cycles
+ * once added. The interval_ms must be a multiple of the manager's base_interval_ms
+ * and must be >= base_interval_ms.
+ *
+ * If init->interval_ms is 0, uses the manager's base_interval_ms.
+ * If init->name is NULL, generates a default name based on the item pointer.
+ *
+ * Context: Process context
+ * Return: Pointer to created monitor item on success, ERR_PTR(-errno) on error
+ */
 struct monitor_item *monitor_add_item(struct monitor_manager *mgr, 
                                      const struct monitor_item_init *init)
 {
@@ -220,17 +289,17 @@ struct monitor_item *monitor_add_item(struct monitor_manager *mgr,
         return ERR_PTR(-EINVAL);
     }
     
-    /* interval_ms 유효성 검사 */
+    /* Validate interval_ms */
     interval_ms = init->interval_ms ? init->interval_ms : mgr->base_interval_ms;
     
-    /* interval_ms가 base_interval_ms의 배수인지 확인 */
+    /* interval_ms must be multiple of base_interval_ms */
     if (interval_ms % mgr->base_interval_ms != 0) {
         monitor_err("Invalid interval %lu ms: must be multiple of base interval %lu ms",
                    interval_ms, mgr->base_interval_ms);
         return ERR_PTR(-EINVAL);
     }
     
-    /* interval_ms가 base_interval_ms보다 작으면 안됨 */
+    /* interval_ms must be >= base_interval_ms */
     if (interval_ms < mgr->base_interval_ms) {
         monitor_err("Invalid interval %lu ms: must be >= base interval %lu ms",
                    interval_ms, mgr->base_interval_ms);
@@ -242,7 +311,7 @@ struct monitor_item *monitor_add_item(struct monitor_manager *mgr,
         return ERR_PTR(-ENOMEM);
     }
     
-    /* 아이템 초기화 */
+    /* Initialize item */
     INIT_LIST_HEAD(&item->list);
     item->interval_ms = interval_ms;
     item->hysteresis = init->hysteresis;
@@ -250,20 +319,20 @@ struct monitor_item *monitor_add_item(struct monitor_manager *mgr,
     item->action_func = init->action_func;
     item->private_data = init->private_data;
     
-    /* 초기 상태 설정 */
+    /* Initialize state */
     item->current_state = 0;
     item->last_action_state = 0;
     item->last_check_time = jiffies;
     
-    /* 히스테리시스 상태 초기화 */
+    /* Initialize hysteresis state */
     item->candidate_state = 0;
     item->consecutive_count = 0;
     
-    /* 통계 초기화 */
+    /* Initialize statistics */
     item->check_count = 0;
     item->action_count = 0;
     
-    /* 이름 설정 */
+    /* Set name */
     if (init->name) {
         strncpy(item->name, init->name, sizeof(item->name) - 1);
         item->name[sizeof(item->name) - 1] = '\0';
@@ -273,7 +342,7 @@ struct monitor_item *monitor_add_item(struct monitor_manager *mgr,
     
     spin_lock_irqsave(&mgr->lock, flags);
     
-    /* 리스트에 추가 */
+    /* Add to list */
     list_add_tail(&item->list, &mgr->item_list);
     
     spin_unlock_irqrestore(&mgr->lock, flags);
@@ -284,7 +353,18 @@ struct monitor_item *monitor_add_item(struct monitor_manager *mgr,
     return item;
 }
 
-/* 모니터 아이템 제거 */
+/**
+ * monitor_remove_item() - Remove a monitor item
+ * @mgr: Pointer to monitor manager structure  
+ * @item: Pointer to monitor item to remove
+ *
+ * Removes the specified monitor item from the manager's list and frees its
+ * memory. The item will no longer be monitored after removal. It's safe to
+ * call this function while monitoring is active.
+ *
+ * Context: Process context
+ * Return: 0 on success, -EINVAL if parameters are invalid
+ */
 int monitor_remove_item(struct monitor_manager *mgr, struct monitor_item *item)
 {
     unsigned long flags;
@@ -295,7 +375,7 @@ int monitor_remove_item(struct monitor_manager *mgr, struct monitor_item *item)
     
     spin_lock_irqsave(&mgr->lock, flags);
     
-    /* 리스트에서 제거 */
+    /* Remove from list */
     list_del(&item->list);
     
     spin_unlock_irqrestore(&mgr->lock, flags);
@@ -306,7 +386,17 @@ int monitor_remove_item(struct monitor_manager *mgr, struct monitor_item *item)
     return 0;
 }
 
-/* 모니터 아이템 상태 조회 */
+/**
+ * monitor_get_item_state() - Get current state of a monitor item
+ * @item: Pointer to monitor item
+ * @current_state: Pointer to store current state value
+ *
+ * Retrieves the current state value of the specified monitor item.
+ * This is the most recent value returned by the item's monitor function.
+ *
+ * Context: Any context
+ * Return: 0 on success, -EINVAL if parameters are invalid
+ */
 int monitor_get_item_state(struct monitor_item *item, unsigned long *current_state)
 {
     if (!item || !current_state) {
@@ -317,7 +407,18 @@ int monitor_get_item_state(struct monitor_item *item, unsigned long *current_sta
     return 0;
 }
 
-/* 모니터 아이템 통계 조회 */
+/**
+ * monitor_get_item_stats() - Get statistics for a monitor item
+ * @item: Pointer to monitor item
+ * @check_count: Pointer to store check count (can be NULL)
+ * @action_count: Pointer to store action count (can be NULL)
+ *
+ * Retrieves the statistics for the specified monitor item including the
+ * total number of monitor function calls and action function calls.
+ *
+ * Context: Any context
+ * Return: 0 on success, -EINVAL if item is NULL
+ */
 int monitor_get_item_stats(struct monitor_item *item,
                           unsigned long *check_count, unsigned long *action_count)
 {
@@ -335,7 +436,20 @@ int monitor_get_item_stats(struct monitor_item *item,
     return 0;
 }
 
-/* 모니터 매니저 통계 조회 */
+/**
+ * monitor_get_manager_stats() - Get statistics for the monitor manager
+ * @mgr: Pointer to monitor manager structure
+ * @total_checks: Pointer to store total check count (can be NULL)
+ * @total_actions: Pointer to store total action count (can be NULL)  
+ * @active_items: Pointer to store active item count (can be NULL)
+ *
+ * Retrieves the overall statistics for the monitor manager including total
+ * checks across all items, total actions executed, and the number of
+ * currently active monitor items.
+ *
+ * Context: Any context (briefly holds spinlock)
+ * Return: 0 on success, -EINVAL if manager is invalid
+ */
 int monitor_get_manager_stats(struct monitor_manager *mgr,
                              unsigned long *total_checks, unsigned long *total_actions,
                              unsigned int *active_items)
@@ -368,8 +482,8 @@ int monitor_get_manager_stats(struct monitor_manager *mgr,
     return 0;
 }
 
-/* 모듈 정보 */
-MODULE_AUTHOR("Monitor Library");
+/* Module metadata */
+MODULE_AUTHOR("Dujeong Lee<dujeong.lee82@gmail.com>");
 MODULE_DESCRIPTION("Linux Kernel Monitor Library");
 MODULE_VERSION(MONITOR_VERSION);
 MODULE_LICENSE("GPL");
