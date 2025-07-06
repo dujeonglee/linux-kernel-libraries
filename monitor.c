@@ -27,20 +27,20 @@ static bool monitor_state_changed_with_hysteresis(struct monitor_item *item,
     if (item->hysteresis == 0) {
         return item->last_action_state != new_state;
     }
-    
+
     /* No change from last action state */
     if (item->last_action_state == new_state) {
         item->consecutive_count = 0;
         item->candidate_state = new_state;
         return false;
     }
-    
+
     /* Check if this matches the candidate state */
     if (item->candidate_state == new_state) {
         item->consecutive_count++;
         monitor_debug("Item %s: consecutive count %lu for state %lu (need %lu)",
                      item->name, item->consecutive_count, new_state, item->hysteresis);
-        
+
         /* Hysteresis threshold reached - trigger action */
         if (item->consecutive_count >= item->hysteresis) {
             item->consecutive_count = 0;
@@ -53,7 +53,7 @@ static bool monitor_state_changed_with_hysteresis(struct monitor_item *item,
         monitor_debug("Item %s: new candidate state %lu (count 1, need %lu)",
                      item->name, new_state, item->hysteresis);
     }
-    
+
     return false;
 }
 
@@ -78,21 +78,20 @@ static void monitor_work_func(struct work_struct *work)
     struct monitor_item *item, *tmp;
     unsigned long current_time = jiffies;
     unsigned long flags;
-    
+
     if (!mgr->running) {
         return;
     }
-    
+
     spin_lock_irqsave(&mgr->lock, flags);
-    
+
     /* Iterate through all monitor items */
     list_for_each_entry_safe(item, tmp, &mgr->item_list, list) {
         /* Check if it's time to monitor this item */
         if (time_after(current_time, item->last_check_time + 
                       msecs_to_jiffies(item->interval_ms))) {
-            
             unsigned long new_state;
-            
+
             /* Check if forced state has expired */
             if (item->is_forced && time_after(current_time, item->forced_state_expire_time)) {
                 item->is_forced = false;
@@ -103,13 +102,15 @@ static void monitor_work_func(struct work_struct *work)
             /* Call monitor function */
             if (item->monitor_func) {
                 unsigned long monitor_result = item->monitor_func(item->private_data);
+                bool state_changed;
+
                 item->check_count++;
                 mgr->total_checks++;
-                
+
                 /* Use forced state if active, otherwise use monitor result */
                 if (item->is_forced) {
                     new_state = item->forced_state;
-                    monitor_debug("Item %s: using forced state %lu (monitor returned %lu)",
+                    monitor_debug("Item %s: using forced state %lu (monitor returned %lu)", 
                                  item->name, new_state, monitor_result);
                 } else {
                     new_state = monitor_result;
@@ -118,7 +119,6 @@ static void monitor_work_func(struct work_struct *work)
                 }
 
                 /* Check for state change with hysteresis (ignore hysteresis for forced state) */
-                bool state_changed;
                 if (item->is_forced) {
                     /* For forced state, ignore hysteresis and trigger action immediately */
                     state_changed = (item->last_action_state != new_state);
@@ -606,9 +606,3 @@ int monitor_get_manager_stats(struct monitor_manager *mgr,
     spin_unlock_irqrestore(&mgr->lock, flags);
     return 0;
 }
-
-/* Module metadata */
-MODULE_AUTHOR("Dujeong Lee<dujeong.lee82@gmail.com>");
-MODULE_DESCRIPTION("Linux Kernel Monitor Library");
-MODULE_VERSION(MONITOR_VERSION);
-MODULE_LICENSE("GPL");
