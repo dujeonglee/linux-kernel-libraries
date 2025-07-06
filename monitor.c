@@ -276,7 +276,7 @@ void monitor_stop(struct monitor_manager *mgr)
  * If init->name is NULL, generates a default name based on the item pointer.
  *
  * Context: Process context
- * Return: Pointer to created monitor item on success, ERR_PTR(-errno) on error
+ * Return: Pointer to created monitor item on success, NULL on error
  */
 struct monitor_item *monitor_add_item(struct monitor_manager *mgr, 
                                      const struct monitor_item_init *init)
@@ -286,7 +286,7 @@ struct monitor_item *monitor_add_item(struct monitor_manager *mgr,
     unsigned long interval_ms;
     
     if (!mgr || !mgr->initialized || !init || !init->monitor_func) {
-        return ERR_PTR(-EINVAL);
+        return NULL;
     }
     
     /* Validate interval_ms */
@@ -296,19 +296,19 @@ struct monitor_item *monitor_add_item(struct monitor_manager *mgr,
     if (interval_ms % mgr->base_interval_ms != 0) {
         monitor_err("Invalid interval %lu ms: must be multiple of base interval %lu ms",
                    interval_ms, mgr->base_interval_ms);
-        return ERR_PTR(-EINVAL);
+        return NULL;
     }
     
     /* interval_ms must be >= base_interval_ms */
     if (interval_ms < mgr->base_interval_ms) {
         monitor_err("Invalid interval %lu ms: must be >= base interval %lu ms",
                    interval_ms, mgr->base_interval_ms);
-        return ERR_PTR(-EINVAL);
+        return NULL;
     }
     
     item = kzalloc(sizeof(*item), GFP_KERNEL);
     if (!item) {
-        return ERR_PTR(-ENOMEM);
+        return NULL;
     }
     
     /* Initialize item */
