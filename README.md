@@ -206,11 +206,11 @@ Please use timeout >= 100 ms or redesign your timing requirements
 
 # Monitor Library
 
-A flexible, configurable system monitoring framework for Linux kernel drivers with hysteresis support and intelligent state change detection.
+A flexible, configurable system monitoring framework for Linux kernel drivers with hysteresis support, intelligent state change detection, and forced state functionality.
 
 ## Overview
 
-The Monitor Library provides a comprehensive framework for periodic monitoring of system states with configurable intervals and advanced hysteresis support. It enables registration of monitor functions that check system conditions and trigger actions when significant state changes occur, with built-in protection against state flapping.
+The Monitor Library provides a comprehensive framework for periodic monitoring of system states with configurable intervals and advanced hysteresis support. It enables registration of monitor functions that check system conditions and trigger actions when significant state changes occur, with built-in protection against state flapping and the ability to force specific states for testing or maintenance purposes.
 
 ## Key Features
 
@@ -219,6 +219,7 @@ The Monitor Library provides a comprehensive framework for periodic monitoring o
 - **Hysteresis support**: Prevents state flapping with consecutive detection thresholds
 - **State change detection**: Intelligent filtering of insignificant state changes
 - **Multi-state monitoring**: Support for complex state machines and multiple conditions
+- **Forced state functionality**: Ability to override normal monitoring with user-defined states
 
 ### 🛡️ Stability & Reliability
 - **Anti-flapping protection**: Hysteresis prevents spurious state changes
@@ -231,6 +232,12 @@ The Monitor Library provides a comprehensive framework for periodic monitoring o
 - **Configurable base intervals**: Adjustable system-wide monitoring frequency
 - **Per-item timing**: Individual monitoring intervals for each item
 - **Dynamic management**: Start/stop monitoring on demand
+
+### 🎛️ Forced State Control
+- **Manual state override**: Force specific states for testing or maintenance
+- **Timed expiration**: Forced states automatically expire after specified duration
+- **Seamless transition**: Automatic return to normal monitoring after expiration
+- **Real-time status**: Check if state is forced and remaining time
 
 ### 📊 Comprehensive Statistics
 - **Per-item metrics**: Individual check and action counts
@@ -297,6 +304,23 @@ monitor_start(&mgr);
 // Stop and cleanup
 monitor_stop(&mgr);
 monitor_manager_cleanup(&mgr);
+```
+
+### Forced State Usage
+
+```c
+// Force high temperature state for testing
+monitor_force_state(temp_item, 85, 5000); // Force 85°C for 5 seconds
+
+// Check if state is currently forced
+unsigned long remaining_ms;
+bool is_forced = monitor_is_state_forced(temp_item, &remaining_ms);
+if (is_forced) {
+    pr_info("Temperature forced, %lu ms remaining\n", remaining_ms);
+}
+
+// Clear forced state early (optional - it expires automatically)
+monitor_clear_forced_state(temp_item);
 ```
 
 ### Advanced Pattern: Multi-State System Monitoring
@@ -374,6 +398,17 @@ int monitor_remove_item(struct monitor_manager *mgr, struct monitor_item *item);
 
 Add/remove monitor items. Items are automatically included in the monitoring cycle.
 
+### Forced State Control
+
+```c
+int monitor_force_state(struct monitor_item *item, unsigned long forced_state, 
+                       unsigned long duration_ms);
+int monitor_clear_forced_state(struct monitor_item *item);
+bool monitor_is_state_forced(struct monitor_item *item, unsigned long *remaining_ms);
+```
+
+Control forced state functionality. Force specific states for testing or maintenance, check status, and clear forced states.
+
 ### State and Statistics
 
 ```c
@@ -410,6 +445,23 @@ The monitor library implements sophisticated hysteresis to prevent state flappin
 // is detected 3 consecutive times, preventing flapping
 ```
 
+### Forced State Behavior
+
+```c
+// Normal monitoring with hysteresis = 3
+monitor_start(manager);
+// Monitor function returns: 45, 47, 46, 48...
+// Action called only after 3 consecutive identical readings
+
+// Force state for 10 seconds (hysteresis bypassed)
+monitor_force_state(item, 85, 10000);
+// Item reports: 85 (action called immediately if different from last_action_state)
+// Subsequent forced readings: 85, 85, 85... (no action calls since state unchanged)
+
+// After 10 seconds, forced state expires automatically
+// Monitor function returns: 46, 47, 45... (normal monitoring with hysteresis resumes)
+```
+
 ### Flexible Interval Management
 
 ```c
@@ -443,6 +495,22 @@ monitor_manager_init(&mgr, 1000);
 ```
 
 ## Advanced Features
+
+### Forced State Use Cases
+
+```c
+// Testing scenario: Force critical state to test recovery procedures
+// Action function will be called immediately (hysteresis bypassed)
+monitor_force_state(temp_item, 95, 30000); // Force critical temp for 30 seconds
+
+// Maintenance scenario: Force normal state during maintenance window
+// If current state was abnormal, action called immediately to clear alerts
+monitor_force_state(system_item, STATE_NORMAL, 600000); // Force normal for 10 minutes
+
+// Simulation scenario: Force specific sequence of states
+monitor_force_state(item, STATE_CRITICAL, 5000);  // Immediate action if state changed
+// After 5 seconds, automatically transitions to normal monitoring with hysteresis
+```
 
 ### Hysteresis Configuration
 
@@ -494,7 +562,7 @@ monitor_remove_item(&mgr, runtime_item);
 
 ## Common Patterns
 
-### Pattern 1: Threshold Monitoring
+### Pattern 1: Threshold Monitoring with Forced State Testing
 
 ```c
 // Monitor a value against thresholds
@@ -520,9 +588,12 @@ struct monitor_item_init cpu_init = {
     .action_func = cpu_usage_action,
     .private_data = NULL
 };
+
+// Test high CPU scenario
+monitor_force_state(cpu_item, 95, 10000); // Force 95% for 10 seconds
 ```
 
-### Pattern 2: Multi-Condition Health Check
+### Pattern 2: Multi-Condition Health Check with Maintenance Mode
 
 ```c
 // Monitor multiple system conditions
@@ -538,25 +609,11 @@ static unsigned long check_system_health(void *data) {
     return health;
 }
 
-static void system_health_action(unsigned long old_health, unsigned long new_health, void *data) {
-    unsigned long changed = old_health ^ new_health;
-
-    // Handle each condition change
-    if (changed & HEALTH_OVERHEAT) {
-        if (new_health & HEALTH_OVERHEAT) {
-            pr_crit("System overheating!\n");
-            initiate_emergency_shutdown();
-        } else {
-            pr_info("Temperature normalized\n");
-            cancel_emergency_shutdown();
-        }
-    }
-
-    // Handle other conditions...
-}
+// Force healthy state during maintenance
+monitor_force_state(health_item, 0, 3600000); // Force healthy for 1 hour
 ```
 
-### Pattern 3: Heartbeat and Connectivity Monitoring
+### Pattern 3: Heartbeat and Connectivity Monitoring with Simulation
 
 ```c
 // Monitor external device connectivity
@@ -568,17 +625,8 @@ static unsigned long check_device_heartbeat(void *data) {
     return jiffies_to_msecs(current_time - ctx->last_heartbeat);
 }
 
-static void heartbeat_action(unsigned long old_time, unsigned long new_time, void *data) {
-    struct device_context *ctx = (struct device_context *)data;
-
-    if (new_time > HEARTBEAT_TIMEOUT_MS) {
-        pr_err("Device heartbeat timeout: %lu ms\n", new_time);
-        handle_device_disconnect(ctx);
-    } else if (old_time > HEARTBEAT_TIMEOUT_MS && new_time <= HEARTBEAT_TIMEOUT_MS) {
-        pr_info("Device heartbeat restored: %lu ms\n", new_time);
-        handle_device_reconnect(ctx);
-    }
-}
+// Simulate connection loss for testing
+monitor_force_state(heartbeat_item, HEARTBEAT_TIMEOUT_MS + 1000, 15000); // Simulate timeout for 15 seconds
 ```
 
 ## Performance Characteristics
@@ -587,9 +635,10 @@ static void heartbeat_action(unsigned long old_time, unsigned long new_time, voi
 - **Base overhead**: Minimal workqueue scheduling overhead
 - **Per-item cost**: ~1-5 microseconds per check (depending on monitor function)
 - **Idle optimization**: No CPU usage when no items are active
+- **Forced state overhead**: Negligible additional cost
 
 ### Memory Usage
-- **Per item**: ~128 bytes (struct + list overhead + name)
+- **Per item**: ~140 bytes (struct + list overhead + name + forced state fields)
 - **Manager**: ~64 bytes (context structure)
 - **Dynamic allocation**: Only during add/remove operations
 
@@ -597,6 +646,7 @@ static void heartbeat_action(unsigned long old_time, unsigned long new_time, voi
 - **Items**: Tested with 100+ concurrent monitors
 - **Interval range**: 100ms to hours
 - **Hysteresis range**: 0 to 1000+ consecutive checks
+- **Forced state**: No limit on concurrent forced states
 
 ## Build and Test
 
@@ -625,7 +675,8 @@ make unload_monitor        # Unload modules
 2. **Initialize manager**: Call `monitor_manager_init()` in driver init
 3. **Add monitors**: Create items for conditions to monitor
 4. **Start monitoring**: Call `monitor_start()` when ready
-5. **Cleanup**: Stop monitoring and cleanup in driver exit
+5. **Use forced states**: For testing and maintenance scenarios
+6. **Cleanup**: Stop monitoring and cleanup in driver exit
 
 ### Error Handling
 
@@ -686,6 +737,12 @@ static unsigned long slow_check(void *data) {
 - Check hysteresis configuration
 - Verify state values are actually changing
 - Check action function implementation
+- Check if state is currently forced
+
+**Forced state not working**
+- Verify `monitor_force_state()` was called successfully
+- Check that forced state hasn't expired
+- Use `monitor_is_state_forced()` to verify status
 
 ### Debug Tips
 
@@ -697,6 +754,12 @@ static unsigned long slow_check(void *data) {
 unsigned long current_state;
 monitor_get_item_state(item, &current_state);
 pr_info("Current state: %lu\n", current_state);
+
+// Check if state is forced
+unsigned long remaining_ms;
+bool is_forced = monitor_is_state_forced(item, &remaining_ms);
+pr_info("State forced: %s, remaining: %lu ms\n",
+        is_forced ? "yes" : "no", remaining_ms);
 
 // Check statistics
 unsigned long checks, actions;
