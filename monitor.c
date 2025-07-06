@@ -93,49 +93,75 @@ static void monitor_work_func(struct work_struct *work)
             
             unsigned long new_state;
             
+            /* Check if forced state has expired */
+            if (item->is_forced && time_after(current_time, item->forced_state_expire_time)) {
+                item->is_forced = false;
+                monitor_debug("Item %s: forced state expired, resuming normal monitoring",
+                             item->name);
+            }
+
             /* Call monitor function */
             if (item->monitor_func) {
-                new_state = item->monitor_func(item->private_data);
+                unsigned long monitor_result = item->monitor_func(item->private_data);
                 item->check_count++;
                 mgr->total_checks++;
                 
-                monitor_debug("Item %s: state %lu -> %lu", 
-                             item->name, item->current_state, new_state);
-                
-                /* Check for state change with hysteresis */
-                if (monitor_state_changed_with_hysteresis(item, new_state)) {
+                /* Use forced state if active, otherwise use monitor result */
+                if (item->is_forced) {
+                    new_state = item->forced_state;
+                    monitor_debug("Item %s: using forced state %lu (monitor returned %lu)",
+                                 item->name, new_state, monitor_result);
+                } else {
+                    new_state = monitor_result;
+                    monitor_debug("Item %s: state %lu -> %lu", 
+                                 item->name, item->current_state, new_state);
+                }
+
+                /* Check for state change with hysteresis (ignore hysteresis for forced state) */
+                bool state_changed;
+                if (item->is_forced) {
+                    /* For forced state, ignore hysteresis and trigger action immediately */
+                    state_changed = (item->last_action_state != new_state);
+                    monitor_debug("Item %s: forced state bypass hysteresis, state change %lu -> %lu",
+                                 item->name, item->last_action_state, new_state);
+                } else {
+                    /* Normal hysteresis checking */
+                    state_changed = monitor_state_changed_with_hysteresis(item, new_state);
+                }
+
+                if (state_changed) {
                     /* State changed - call action function */
                     if (item->action_func) {
                         /* Release spinlock before calling action (may sleep) */
                         spin_unlock_irqrestore(&mgr->lock, flags);
-                        
+
                         monitor_debug("Item %s: executing action, state change %lu -> %lu",
                                      item->name, item->last_action_state, new_state);
-                        
+
                         item->action_func(item->last_action_state, new_state, item->private_data);
-                        
+
                         spin_lock_irqsave(&mgr->lock, flags);
-                        
+
                         /* List might have changed - recheck manager state */
                         if (!mgr->running) {
                             spin_unlock_irqrestore(&mgr->lock, flags);
                             return;
                         }
-                        
+
                         item->last_action_state = new_state;
                         item->action_count++;
                         mgr->total_actions++;
                     }
                 }
-                
+
                 item->current_state = new_state;
                 item->last_check_time = current_time;
             }
         }
     }
-    
+
     spin_unlock_irqrestore(&mgr->lock, flags);
-    
+
     /* Schedule next execution */
     if (mgr->running) {
         schedule_delayed_work(&mgr->work, msecs_to_jiffies(mgr->base_interval_ms));
@@ -160,21 +186,115 @@ int monitor_manager_init(struct monitor_manager *mgr, unsigned long base_interva
     if (!mgr) {
         return -EINVAL;
     }
-    
+
     memset(mgr, 0, sizeof(*mgr));
-    
+
     INIT_LIST_HEAD(&mgr->item_list);
     INIT_DELAYED_WORK(&mgr->work, monitor_work_func);
     spin_lock_init(&mgr->lock);
-    
+
     mgr->base_interval_ms = base_interval_ms ? base_interval_ms : DEFAULT_MONITOR_INTERVAL_MS;
     mgr->running = false;
     mgr->initialized = true;
-    
+
     monitor_info("Monitor manager initialized with base interval %lu ms", 
                  mgr->base_interval_ms);
-    
+
     return 0;
+}
+
+/**
+ * monitor_force_state() - Force a monitor item to a specific state
+ * @item: Pointer to monitor item
+ * @forced_state: State value to force
+ * @duration_ms: Duration in milliseconds to maintain the forced state
+ *
+ * Forces the monitor item to report the specified state for the given duration.
+ * During this time, the actual monitor function is still called but its return
+ * value is ignored. Hysteresis is bypassed for forced states, causing immediate
+ * action function calls when the state changes. After the duration expires, 
+ * normal monitoring resumes with hysteresis behavior restored.
+ * If the item already has a forced state, it will be overwritten.
+ *
+ * Context: Any context
+ * Return: 0 on success, -EINVAL if parameters are invalid
+ */
+int monitor_force_state(struct monitor_item *item, unsigned long forced_state, 
+                       unsigned long duration_ms)
+{
+    unsigned long current_time = jiffies;
+
+    if (!item || duration_ms == 0) {
+        return -EINVAL;
+    }
+
+    item->forced_state = forced_state;
+    item->forced_state_expire_time = current_time + msecs_to_jiffies(duration_ms);
+    item->is_forced = true;
+
+    monitor_info("Item %s: forced state %lu for %lu ms", 
+                 item->name, forced_state, duration_ms);
+
+    return 0;
+}
+
+/**
+ * monitor_clear_forced_state() - Clear forced state and resume normal monitoring
+ * @item: Pointer to monitor item
+ *
+ * Immediately clears any forced state and resumes normal monitoring behavior.
+ * If no forced state is active, this function has no effect.
+ *
+ * Context: Any context
+ * Return: 0 on success, -EINVAL if item is NULL
+ */
+int monitor_clear_forced_state(struct monitor_item *item)
+{
+    if (!item) {
+        return -EINVAL;
+    }
+
+    if (item->is_forced) {
+        item->is_forced = false;
+        monitor_info("Item %s: forced state cleared, resuming normal monitoring", 
+                     item->name);
+    }
+
+    return 0;
+}
+
+/**
+ * monitor_is_state_forced() - Check if a monitor item has forced state
+ * @item: Pointer to monitor item
+ * @remaining_ms: Pointer to store remaining time in milliseconds (can be NULL)
+ *
+ * Checks if the monitor item currently has a forced state active.
+ * Optionally returns the remaining time before forced state expires.
+ * If the forced state has already expired, it will be automatically cleared.
+ *
+ * Context: Any context
+ * Return: true if state is forced, false otherwise
+ */
+bool monitor_is_state_forced(struct monitor_item *item, unsigned long *remaining_ms)
+{
+    unsigned long current_time = jiffies;
+
+    if (!item) {
+        return false;
+    }
+
+    /* Check if forced state has expired */
+    if (item->is_forced && time_after(current_time, item->forced_state_expire_time)) {
+        item->is_forced = false;
+        monitor_debug("Item %s: forced state expired during check", item->name);
+    }
+
+    if (item->is_forced && remaining_ms) {
+        unsigned long remaining_jiffies = item->forced_state_expire_time - current_time;
+        *remaining_ms = jiffies_to_msecs(remaining_jiffies);
+    }
+
+    return item->is_forced;
 }
 
 /**
@@ -191,14 +311,14 @@ void monitor_manager_cleanup(struct monitor_manager *mgr)
 {
     struct monitor_item *item, *tmp;
     unsigned long flags;
-    
+
     if (!mgr || !mgr->initialized) {
         return;
     }
-    
+
     /* Stop monitoring */
     monitor_stop(mgr);
-    
+
     /* Remove and free all items */
     spin_lock_irqsave(&mgr->lock, flags);
     list_for_each_entry_safe(item, tmp, &mgr->item_list, list) {
@@ -206,9 +326,9 @@ void monitor_manager_cleanup(struct monitor_manager *mgr)
         kfree(item);
     }
     spin_unlock_irqrestore(&mgr->lock, flags);
-    
+
     mgr->initialized = false;
-    
+
     monitor_info("Monitor manager cleaned up");
 }
 
@@ -228,14 +348,14 @@ int monitor_start(struct monitor_manager *mgr)
     if (!mgr || !mgr->initialized) {
         return -EINVAL;
     }
-    
+
     if (mgr->running) {
         return -EALREADY;
     }
-    
+
     mgr->running = true;
     schedule_delayed_work(&mgr->work, msecs_to_jiffies(mgr->base_interval_ms));
-    
+
     monitor_info("Monitor started");
     return 0;
 }
@@ -255,10 +375,10 @@ void monitor_stop(struct monitor_manager *mgr)
     if (!mgr || !mgr->initialized) {
         return;
     }
-    
+
     mgr->running = false;
     cancel_delayed_work_sync(&mgr->work);
-    
+
     monitor_info("Monitor stopped");
 }
 
@@ -284,33 +404,33 @@ struct monitor_item *monitor_add_item(struct monitor_manager *mgr,
     struct monitor_item *item;
     unsigned long flags;
     unsigned long interval_ms;
-    
+
     if (!mgr || !mgr->initialized || !init || !init->monitor_func) {
         return NULL;
     }
-    
+
     /* Validate interval_ms */
     interval_ms = init->interval_ms ? init->interval_ms : mgr->base_interval_ms;
-    
+
     /* interval_ms must be multiple of base_interval_ms */
     if (interval_ms % mgr->base_interval_ms != 0) {
         monitor_err("Invalid interval %lu ms: must be multiple of base interval %lu ms",
                    interval_ms, mgr->base_interval_ms);
         return NULL;
     }
-    
+
     /* interval_ms must be >= base_interval_ms */
     if (interval_ms < mgr->base_interval_ms) {
         monitor_err("Invalid interval %lu ms: must be >= base interval %lu ms",
                    interval_ms, mgr->base_interval_ms);
         return NULL;
     }
-    
+
     item = kzalloc(sizeof(*item), GFP_KERNEL);
     if (!item) {
         return NULL;
     }
-    
+
     /* Initialize item */
     INIT_LIST_HEAD(&item->list);
     item->interval_ms = interval_ms;
@@ -318,20 +438,25 @@ struct monitor_item *monitor_add_item(struct monitor_manager *mgr,
     item->monitor_func = init->monitor_func;
     item->action_func = init->action_func;
     item->private_data = init->private_data;
-    
+
     /* Initialize state */
     item->current_state = 0;
     item->last_action_state = 0;
     item->last_check_time = jiffies;
-    
+
     /* Initialize hysteresis state */
     item->candidate_state = 0;
     item->consecutive_count = 0;
-    
+
+    /* Initialize forced state management */
+    item->forced_state = 0;
+    item->forced_state_expire_time = 0;
+    item->is_forced = false;
+
     /* Initialize statistics */
     item->check_count = 0;
     item->action_count = 0;
-    
+
     /* Set name */
     if (init->name) {
         strncpy(item->name, init->name, sizeof(item->name) - 1);
@@ -339,17 +464,17 @@ struct monitor_item *monitor_add_item(struct monitor_manager *mgr,
     } else {
         snprintf(item->name, sizeof(item->name), "item_%p", item);
     }
-    
+
     spin_lock_irqsave(&mgr->lock, flags);
-    
+
     /* Add to list */
     list_add_tail(&item->list, &mgr->item_list);
-    
+
     spin_unlock_irqrestore(&mgr->lock, flags);
-    
+
     monitor_info("Added monitor item '%s' (addr:%p, interval:%lu ms, hysteresis:%lu)",
                  item->name, item, item->interval_ms, item->hysteresis);
-    
+
     return item;
 }
 
@@ -368,21 +493,21 @@ struct monitor_item *monitor_add_item(struct monitor_manager *mgr,
 int monitor_remove_item(struct monitor_manager *mgr, struct monitor_item *item)
 {
     unsigned long flags;
-    
+
     if (!mgr || !mgr->initialized || !item) {
         return -EINVAL;
     }
-    
+
     spin_lock_irqsave(&mgr->lock, flags);
-    
+
     /* Remove from list */
     list_del(&item->list);
-    
+
     spin_unlock_irqrestore(&mgr->lock, flags);
-    
+
     monitor_info("Removed monitor item '%s' (addr:%p)", item->name, item);
     kfree(item);
-    
+
     return 0;
 }
 
@@ -402,7 +527,7 @@ int monitor_get_item_state(struct monitor_item *item, unsigned long *current_sta
     if (!item || !current_state) {
         return -EINVAL;
     }
-    
+
     *current_state = item->current_state;
     return 0;
 }
@@ -425,14 +550,14 @@ int monitor_get_item_stats(struct monitor_item *item,
     if (!item) {
         return -EINVAL;
     }
-    
+
     if (check_count) {
         *check_count = item->check_count;
     }
     if (action_count) {
         *action_count = item->action_count;
     }
-    
+
     return 0;
 }
 
@@ -457,27 +582,27 @@ int monitor_get_manager_stats(struct monitor_manager *mgr,
     struct monitor_item *item;
     unsigned long flags;
     unsigned int count = 0;
-    
+
     if (!mgr || !mgr->initialized) {
         return -EINVAL;
     }
-    
+
     spin_lock_irqsave(&mgr->lock, flags);
-    
+
     if (total_checks) {
         *total_checks = mgr->total_checks;
     }
     if (total_actions) {
         *total_actions = mgr->total_actions;
     }
-    
+
     if (active_items) {
         list_for_each_entry(item, &mgr->item_list, list) {
             count++;
         }
         *active_items = count;
     }
-    
+
     spin_unlock_irqrestore(&mgr->lock, flags);
     return 0;
 }

@@ -231,7 +231,6 @@ struct watchdog_item *watchdog_add(unsigned long timeout_ms,
 	/* Check if we need to start/adjust work period */
 	update_work_period();
 
-
 	return item;
 }
 
@@ -284,7 +283,6 @@ int watchdog_remove(struct watchdog_item *item)
 
 	/* Check if we need to adjust work period or stop work */
 	update_work_period();
-
 
 	return 0;
 }
