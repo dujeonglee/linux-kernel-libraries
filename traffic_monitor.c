@@ -1,6 +1,4 @@
-#include <linux/types.h>
 #include <linux/kernel.h>
-#include <linux/module.h>
 #include <linux/netdevice.h>
 #include <linux/hashtable.h>
 #include <linux/slab.h>
@@ -8,7 +6,6 @@
 #include <linux/spinlock.h>
 #include <linux/notifier.h>
 #include <linux/workqueue.h>
-#include <linux/delay.h>
 
 /**
  * Target device names to monitor (read-only configuration)
@@ -473,7 +470,6 @@ struct simple_net_device_stats netdevice_stats_delta_single(const char* ifname)
 
     return delta;
 }
-EXPORT_SYMBOL(netdevice_stats_delta_single);
 
 /**
  * netdevice_stats_delta_all - Get aggregate per-second traffic for all devices
@@ -524,7 +520,6 @@ struct simple_net_device_stats netdevice_stats_delta_all(void)
 
     return total_delta;
 }
-EXPORT_SYMBOL(netdevice_stats_delta_all);
 
 /**
  * traffic_netdev_event - Network device event handler
@@ -652,7 +647,6 @@ int init_traffic_monitor(void)
     printk(KERN_INFO "traffic_monitor: Traffic monitoring module initialized\n");
     return 0;
 }
-EXPORT_SYMBOL(init_traffic_monitor);
 
 /**
  * cleanup_traffic_monitor - Clean up the traffic monitoring module
@@ -684,4 +678,3 @@ void cleanup_traffic_monitor(void)
     
     printk(KERN_INFO "traffic_monitor: Traffic monitoring module cleaned up\n");
 }
-EXPORT_SYMBOL(cleanup_traffic_monitor);

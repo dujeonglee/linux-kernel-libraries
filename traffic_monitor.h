@@ -2,7 +2,6 @@
 #define _TRAFFIC_MONITOR_H
 
 #include <linux/types.h>
-#include <linux/netdevice.h>
 
 #define TRAFFIC_STATS_TO_MBPS(bytes_per_sec) ((bytes_per_sec) * 8 / 1000000ULL)
 #define TRAFFIC_STATS_TO_KBPS(bytes_per_sec) ((bytes_per_sec) * 8 / 1000ULL)  
