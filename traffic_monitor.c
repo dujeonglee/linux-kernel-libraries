@@ -8,7 +8,14 @@
 #include <linux/workqueue.h>
 
 /**
- * Target device names to monitor (read-only configuration)
+ * target_devices - Array of network interface names to monitor
+ *
+ * This array contains a list of common network interface names that the
+ * traffic monitoring system will attempt to track.
+ *
+ * The array is NULL-terminated to allow for easy iteration. This is a
+ * read-only configuration that defines which network devices should be
+ * monitored for traffic statistics.
  */
 static const char* target_devices[] = {
     "eth0",
@@ -22,47 +29,79 @@ static const char* target_devices[] = {
 };
 
 /**
- * @def NETDEV_HASH_BITS
- * @brief Hash table size bits for network device monitoring
+ * NETDEV_HASH_BITS - Number of bits for network device hash table size
+ *
+ * Defines the number of bits used to determine the hash table size for
+ * network device monitoring. The actual hash table size will be 2^4 = 16
+ * entries. This provides a reasonable balance between memory usage and
+ * hash collision probability for typical network device monitoring scenarios.
  */
 #define NETDEV_HASH_BITS 4
 
 /**
- * @def MONITOR_INTERVAL_MS
- * @brief Monitoring interval in milliseconds
+ * MONITOR_INTERVAL_MS - Traffic monitoring sampling interval in milliseconds
+ *
+ * Defines the time interval between consecutive traffic statistics sampling
+ * operations. A 100ms interval provides sufficiently granular monitoring
+ * while avoiding excessive system overhead. This interval determines the
+ * frequency at which network interface statistics are read and processed.
  */
 #define MONITOR_INTERVAL_MS 100
 
 /**
- * @var netdev_monitor_hash
- * @brief Hash table for storing actively monitored network devices
+ * netdev_monitor_hash - Hash table for actively monitored network devices
+ *
+ * This hash table stores network device monitoring entries, providing fast
+ * lookup and access to device-specific traffic statistics. The table size
+ * is determined by NETDEV_HASH_BITS and uses the kernel's standard hash
+ * table implementation for efficient device management.
  */
 DECLARE_HASHTABLE(netdev_monitor_hash, NETDEV_HASH_BITS);
 
 /**
- * @var netdev_monitor_rwlock
- * @brief RW lock for protecting monitor hash table operations
- * Read lock: Used for querying statistics (delta functions)
- * Write lock: Used for modifying hash table structure and updating stats
+ * netdev_monitor_rwlock - Reader-writer lock for monitor hash table protection
+ *
+ * This rwlock synchronizes access to the netdev_monitor_hash table:
+ * - Read lock: Acquired when querying statistics or performing read-only
+ *   operations on existing monitor entries (e.g., delta calculations)
+ * - Write lock: Acquired when modifying the hash table structure, such as
+ *   adding/removing devices or updating statistics that require exclusive access
+ *
+ * The rwlock allows multiple concurrent readers while ensuring exclusive
+ * access for writers, optimizing performance for the common case of
+ * statistics queries.
  */
 static DEFINE_RWLOCK(netdev_monitor_rwlock);
 
 
 /**
- * @var monitor_work
- * @brief Delayed work for periodic statistics monitoring
+ * monitor_work - Delayed work structure for periodic statistics monitoring
+ *
+ * This delayed work item is scheduled periodically to collect network
+ * interface statistics from all monitored devices. The work function
+ * runs at intervals defined by MONITOR_INTERVAL_MS and updates the
+ * traffic statistics for each device in the monitoring hash table.
  */
 static struct delayed_work monitor_work;
 
 /**
- * @var active_monitors
- * @brief Counter for active monitored devices
+ * active_monitors - Atomic counter tracking number of monitored devices
+ *
+ * This atomic counter maintains the current number of network devices
+ * being actively monitored. It is incremented when a new device is
+ * added to monitoring and decremented when a device is removed.
+ * The counter is used to determine when monitoring can be safely
+ * stopped (when it reaches zero).
  */
 static atomic_t active_monitors = ATOMIC_INIT(0);
 
 /**
- * @var monitor_stop_flag
- * @brief Flag to signal monitoring should stop
+ * monitor_stop_flag - Atomic flag to signal monitoring termination
+ *
+ * This atomic flag is used to coordinate the shutdown of the monitoring
+ * subsystem. When set to non-zero, it signals that monitoring should
+ * stop and all pending work should be cancelled. The flag ensures
+ * clean termination of monitoring operations across multiple contexts.
  */
 static atomic_t monitor_stop_flag = ATOMIC_INIT(0);
 
@@ -70,10 +109,13 @@ static atomic_t monitor_stop_flag = ATOMIC_INIT(0);
  * struct simple_net_device_stats - Simplified network device statistics
  * @tx_packets: Number of transmitted packets
  * @tx_bytes: Number of transmitted bytes
- * @rx_packets: Number of received packets  
+ * @rx_packets: Number of received packets
  * @rx_bytes: Number of received bytes
- * 
- * Simplified version containing only essential traffic statistics.
+ *
+ * This structure contains essential traffic statistics for a network device,
+ * providing a simplified subset of the full kernel network device statistics.
+ * It tracks only the core transmit and receive counters needed for basic
+ * traffic monitoring and rate calculations.
  */
 struct simple_net_device_stats {
     u64 tx_packets;
@@ -86,13 +128,17 @@ struct simple_net_device_stats {
  * struct netdev_monitor_entry - Network device monitoring entry
  * @dev: Pointer to the monitored network device
  * @current_stats: Current simplified network device statistics
- * @prev_stats: Previous simplified network device statistics  
+ * @prev_stats: Previous simplified network device statistics
  * @current_stats_jiffies: Timestamp (jiffies) when current stats were updated
  * @prev_stats_jiffies: Timestamp (jiffies) when previous stats were updated
  * @hash_node: Hash table node for linking entries
  * @ifname: Network interface name (null-terminated string)
- * 
- * This structure holds monitoring information for a single network device.
+ *
+ * This structure holds monitoring information for a single network device,
+ * maintaining both current and previous statistics snapshots to enable
+ * rate calculations. The structure is designed to be stored in a hash table
+ * for efficient device lookup and includes timing information for accurate
+ * delta calculations between measurement intervals.
  */
 struct netdev_monitor_entry {
     struct net_device *dev;
@@ -108,9 +154,12 @@ struct netdev_monitor_entry {
  * is_target_device - Check if device name is in target list
  * @ifname: Network interface name to check
  *
- * Context: Any context. Uses spinlock for protection.
+ * Determines whether the given network interface name matches any of the
+ * devices listed in the target_devices array. This function is used to
+ * filter which network devices should be monitored for traffic statistics.
  *
- * Return: true if device is a target, false otherwise
+ * Context: Any context. No locking required as target_devices is read-only.
+ * Return: true if device is in the target list, false otherwise
  */
 static bool is_target_device(const char *ifname)
 {
@@ -131,16 +180,23 @@ static bool is_target_device(const char *ifname)
  * register_monitor_netdevice - Register a network device for monitoring
  * @ifname: Network interface name to register
  *
- * This function finds the network device by name and adds it to the
- * monitoring hash table. The device reference count is incremented.
- * 
- * Context: Process context. Can sleep due to memory allocation.
- * 
+ * Finds the network device by name and adds it to the monitoring hash table
+ * for traffic statistics collection. The function validates the interface
+ * name, looks up the device in the network namespace, checks for duplicates,
+ * and creates a new monitoring entry. A reference to the network device is
+ * held to prevent it from being freed while monitored.
+ *
+ * The monitoring entry is initialized with zero statistics and added to the
+ * hash table under write lock protection. The active monitor count is
+ * incremented upon successful registration.
+ *
+ * Context: Process context. Can sleep due to memory allocation with GFP_ATOMIC.
+ *          Uses write lock with IRQ disable for hash table protection.
  * Return: 
  * * 0 - Success
- * * -EINVAL - Invalid interface name
+ * * -EINVAL - Invalid interface name or name too long
  * * -ENODEV - Network device not found
- * * -EEXIST - Device already registered  
+ * * -EEXIST - Device already registered for monitoring
  * * -ENOMEM - Memory allocation failed
  */
 static int register_monitor_netdevice(const char* ifname)
@@ -203,15 +259,21 @@ static int register_monitor_netdevice(const char* ifname)
  * unregister_monitor_netdevice - Unregister a network device from monitoring
  * @ifname: Network interface name to unregister
  *
- * This function removes the network device from the monitoring hash table
- * and releases the device reference. All associated memory is freed.
- * Safe to call multiple times - duplicate calls are ignored.
+ * Removes the specified network device from the monitoring hash table and
+ * cleans up all associated resources. The function searches for the device
+ * entry in the hash table, removes it from the table, releases the network
+ * device reference that was acquired during registration, and frees the
+ * monitoring entry memory.
  *
- * Context: Process context.
+ * The active monitor count is decremented when a device is successfully
+ * removed. The function is safe to call multiple times for the same device -
+ * duplicate unregistration attempts are handled gracefully and return success.
  *
+ * Context: Process context. Uses write lock with IRQ disable for hash table
+ *          protection during removal operations.
  * Return:
- * * 0 - Success or already unregistered
- * * -EINVAL - Invalid interface name
+ * * 0 - Success (device unregistered or was already unregistered)
+ * * -EINVAL - Invalid interface name (NULL pointer)
  */
 static int unregister_monitor_netdevice(const char* ifname)
 {
@@ -254,13 +316,18 @@ static int unregister_monitor_netdevice(const char* ifname)
  * @current: Current counter value
  * @prev: Previous counter value
  *
- * This function calculates the difference between two counter values,
- * properly handling the case where the counter has wrapped around due
- * to overflow (current < prev).
+ * Calculates the difference between two counter values while properly
+ * handling counter overflow scenarios. Network statistics counters are
+ * typically monotonic but can wrap around when they exceed the maximum
+ * value for their data type (ULONG_MAX for unsigned long).
  *
- * Context: Any context.
+ * When overflow is detected (current < prev), the function calculates
+ * the delta as if the counter wrapped from ULONG_MAX back to 0. This
+ * ensures accurate delta calculations even when counters overflow during
+ * the monitoring interval.
  *
- * Return: Difference value accounting for potential overflow
+ * Context: Any context. No locking required.
+ * Return: Difference value accounting for potential counter overflow
  */
 static inline unsigned long calc_delta_with_overflow(unsigned long current, unsigned long prev)
 {
@@ -277,12 +344,16 @@ static inline unsigned long calc_delta_with_overflow(unsigned long current, unsi
  * @delta: Difference value to convert
  * @time_delta_jiffies: Time difference in jiffies
  *
- * This function converts a raw delta value to a per-second rate using
- * the formula: (delta * HZ) / time_delta_jiffies
+ * Converts a raw counter delta value to a per-second rate by normalizing
+ * the delta over the time interval. The calculation uses the kernel's HZ
+ * constant to convert from jiffies to seconds: rate = (delta * HZ) / time_delta.
  *
- * Context: Any context.
+ * This function is essential for converting raw counter differences into
+ * meaningful rate measurements (e.g., bytes/sec, packets/sec) regardless
+ * of the actual sampling interval used.
  *
- * Return: Per-second rate, 0 if time_delta_jiffies is 0
+ * Context: Any context. No locking required.
+ * Return: Per-second rate, or 0 if time_delta_jiffies is 0 (to avoid division by zero)
  */
 static inline unsigned long calc_per_sec_rate(unsigned long delta, unsigned long time_delta_jiffies)
 {
@@ -293,14 +364,25 @@ static inline unsigned long calc_per_sec_rate(unsigned long delta, unsigned long
 }
 
 /**
- * update_device_stats - Update statistics for a single device
+ * update_device_stats - Update statistics for a single monitored device
  * @entry: Monitor entry to update
- * @update_jiffies: Current jiffies timestamp
+ * @update_jiffies: Current jiffies timestamp for this update
  *
- * This function updates the statistics for a single monitored device,
- * moving current stats to previous and fetching new current stats.
+ * Updates the traffic statistics for a monitored network device by moving
+ * the current statistics to previous and fetching fresh statistics from
+ * the device. This creates a snapshot pair needed for delta calculations.
  *
- * Context: Called with netdev_monitor_lock held.
+ * The function first attempts to use the device's ndo_get_stats operation
+ * if available, which may provide more accurate or device-specific statistics.
+ * If that method is not available, it falls back to reading directly from
+ * the device's built-in stats structure.
+ *
+ * The timestamp is updated to reflect when this statistics snapshot was
+ * taken, enabling accurate rate calculations based on the time difference
+ * between consecutive updates.
+ *
+ * Context: Must be called with netdev_monitor_rwlock held for write access.
+ *          The device reference is guaranteed valid during the call.
  */
 static void update_device_stats(struct netdev_monitor_entry *entry, unsigned long update_jiffies)
 {
@@ -334,11 +416,20 @@ static void update_device_stats(struct netdev_monitor_entry *entry, unsigned lon
 /**
  * monitor_netdevices - Update statistics for all monitored devices
  *
- * This function updates the statistics for all registered network devices.
- * Current statistics become previous statistics, and new current statistics
- * are fetched from the devices. Timestamps are also updated accordingly.
+ * Iterates through all registered network devices in the monitoring hash
+ * table and updates their traffic statistics. For each device, the current
+ * statistics become the previous statistics, and fresh statistics are
+ * fetched from the network device. All devices are updated with the same
+ * timestamp to ensure consistent timing across the monitoring system.
  *
- * Context: Any context. Uses spinlock_irqsave for protection.
+ * This function is typically called periodically by the monitoring work
+ * queue to maintain up-to-date statistics for rate calculations. The
+ * consistent timestamp across all devices enables accurate comparative
+ * analysis of traffic rates.
+ *
+ * Context: Any context. Uses write lock with IRQ disable to protect
+ *          hash table iteration and prevent device list modifications
+ *          during the update process.
  */
 static void monitor_netdevices(void)
 {
@@ -358,12 +449,24 @@ static void monitor_netdevices(void)
 
 /**
  * monitor_work_handler - Delayed work handler for periodic monitoring
- * @work: Work structure
+ * @work: Work structure (unused, but required by work queue interface)
  *
- * This function is called periodically to update network device statistics.
- * It reschedules itself if there are active monitors, otherwise stops.
+ * Periodic work function that updates network device statistics for all
+ * monitored devices and manages the monitoring lifecycle. The function
+ * first checks the stop flag to handle clean shutdown scenarios, then
+ * updates statistics for all registered devices.
  *
- * Context: Work queue context.
+ * The work handler implements a self-rescheduling pattern: it continues
+ * to reschedule itself at MONITOR_INTERVAL_MS intervals as long as there
+ * are active monitors and the stop flag is not set. When no devices are
+ * being monitored or a stop is requested, the periodic updates cease
+ * automatically.
+ *
+ * This design ensures that monitoring overhead is only incurred when
+ * devices are actually being tracked, and provides clean termination
+ * during module unload or system shutdown.
+ *
+ * Context: Work queue context. Can sleep and be preempted.
  */
 static void monitor_work_handler(struct work_struct *work)
 {
@@ -391,10 +494,19 @@ static void monitor_work_handler(struct work_struct *work)
 /**
  * start_monitoring - Start periodic monitoring if not already running
  *
- * This function starts the delayed work for periodic monitoring if it's
- * not already running.
+ * Initiates the periodic monitoring work queue if this is the first device
+ * being monitored. The function checks if the active monitor count has
+ * reached 1, indicating that monitoring should begin. This lazy-start
+ * approach ensures that the periodic work is only scheduled when there
+ * are actually devices to monitor.
  *
- * Context: Any context.
+ * The monitoring work is scheduled to run after MONITOR_INTERVAL_MS
+ * milliseconds and will continue to reschedule itself as long as there
+ * are active monitors. If monitoring is already running (active_monitors > 1),
+ * this function does nothing, avoiding duplicate work scheduling.
+ *
+ * Context: Any context. Should be called after successfully registering
+ *          a device and incrementing active_monitors count.
  */
 static void start_monitoring(void)
 {
@@ -406,139 +518,140 @@ static void start_monitoring(void)
 }
 
 /**
- * netdevice_stats_delta_single - Get per-second traffic delta for a device
- * @ifname: Network interface name
+ * netdevice_stats_delta - Get per-second traffic delta for device(s)
+ * @ifname: Network interface name, or NULL for all devices
  *
- * This function calculates the per-second rate of change for basic traffic
- * statistics (tx/rx packets and bytes) of the specified device.
+ * Calculates the per-second rate of change for basic traffic statistics
+ * (tx/rx packets and bytes). If ifname is provided, returns statistics
+ * for that specific device. If ifname is NULL, returns aggregate statistics
+ * for all monitored devices.
  *
- * Context: Any context. Uses spinlock_irqsave for protection.
+ * The function performs overflow-safe delta calculations between current
+ * and previous statistics snapshots, then converts the raw deltas to
+ * per-second rates using the time difference between snapshots. Each
+ * device may have different sampling intervals, so time-based normalization
+ * ensures accurate rate calculations.
  *
+ * For single device queries, if the device is not found in the monitoring
+ * table, all fields in the returned structure will be zero and a warning
+ * message is logged.
+ *
+ * Context: Any context. Uses read lock with IRQ disable to protect
+ *          hash table access during statistics calculation.
  * Return: struct simple_net_device_stats containing per-second rates.
- *         All fields will be zero if device not found or on error.
+ *         For single device: zero-filled structure if device not found.
+ *         For all devices: aggregate rates across all monitored devices.
  */
-struct simple_net_device_stats netdevice_stats_delta_single(const char* ifname)
+struct simple_net_device_stats netdevice_stats_delta(const char* ifname)
 {
     struct simple_net_device_stats delta;
     struct netdev_monitor_entry *entry;
     unsigned long flags;
     u32 hash_key;
     bool found = false;
+    int bkt;
     unsigned long time_delta_jiffies;
     unsigned long raw_delta;
 
     memset(&delta, 0, sizeof(delta));
 
-    if (!ifname)
-        return delta;
-
     read_lock_irqsave(&netdev_monitor_rwlock, flags);
 
-    hash_key = full_name_hash(NULL, ifname, strlen(ifname));
-    hash_for_each_possible(netdev_monitor_hash, entry, hash_node, hash_key) {
-        if (strcmp(entry->ifname, ifname) == 0) {
-            // Calculate time delta
+    if (ifname) {
+        // Single device mode
+        hash_key = full_name_hash(NULL, ifname, strlen(ifname));
+        hash_for_each_possible(netdev_monitor_hash, entry, hash_node, hash_key) {
+            if (strcmp(entry->ifname, ifname) == 0) {
+                // Calculate time delta
+                if (entry->current_stats_jiffies >= entry->prev_stats_jiffies) {
+                    time_delta_jiffies = entry->current_stats_jiffies - entry->prev_stats_jiffies;
+                } else {
+                    time_delta_jiffies = (ULONG_MAX - entry->prev_stats_jiffies) + entry->current_stats_jiffies + 1;
+                }
+
+                // Calculate per-second rates
+                raw_delta = calc_delta_with_overflow(entry->current_stats.tx_packets, entry->prev_stats.tx_packets);
+                delta.tx_packets = calc_per_sec_rate(raw_delta, time_delta_jiffies);
+
+                raw_delta = calc_delta_with_overflow(entry->current_stats.tx_bytes, entry->prev_stats.tx_bytes);
+                delta.tx_bytes = calc_per_sec_rate(raw_delta, time_delta_jiffies);
+
+                raw_delta = calc_delta_with_overflow(entry->current_stats.rx_packets, entry->prev_stats.rx_packets);
+                delta.rx_packets = calc_per_sec_rate(raw_delta, time_delta_jiffies);
+
+                raw_delta = calc_delta_with_overflow(entry->current_stats.rx_bytes, entry->prev_stats.rx_bytes);
+                delta.rx_bytes = calc_per_sec_rate(raw_delta, time_delta_jiffies);
+
+                found = true;
+                break;
+            }
+        }
+
+        if (!found) {
+            printk(KERN_WARNING "traffic_monitor: Device %s not found in monitor list\n", ifname);
+        }
+    } else {
+        // All devices mode - aggregate statistics
+        hash_for_each(netdev_monitor_hash, bkt, entry, hash_node) {
+            // Calculate time delta for this device
             if (entry->current_stats_jiffies >= entry->prev_stats_jiffies) {
                 time_delta_jiffies = entry->current_stats_jiffies - entry->prev_stats_jiffies;
             } else {
                 time_delta_jiffies = (ULONG_MAX - entry->prev_stats_jiffies) + entry->current_stats_jiffies + 1;
             }
 
-            // Calculate per-second rates
+            // Add per-second rates to total
             raw_delta = calc_delta_with_overflow(entry->current_stats.tx_packets, entry->prev_stats.tx_packets);
-            delta.tx_packets = calc_per_sec_rate(raw_delta, time_delta_jiffies);
+            delta.tx_packets += calc_per_sec_rate(raw_delta, time_delta_jiffies);
 
             raw_delta = calc_delta_with_overflow(entry->current_stats.tx_bytes, entry->prev_stats.tx_bytes);
-            delta.tx_bytes = calc_per_sec_rate(raw_delta, time_delta_jiffies);
+            delta.tx_bytes += calc_per_sec_rate(raw_delta, time_delta_jiffies);
 
             raw_delta = calc_delta_with_overflow(entry->current_stats.rx_packets, entry->prev_stats.rx_packets);
-            delta.rx_packets = calc_per_sec_rate(raw_delta, time_delta_jiffies);
+            delta.rx_packets += calc_per_sec_rate(raw_delta, time_delta_jiffies);
 
             raw_delta = calc_delta_with_overflow(entry->current_stats.rx_bytes, entry->prev_stats.rx_bytes);
-            delta.rx_bytes = calc_per_sec_rate(raw_delta, time_delta_jiffies);
-
-            found = true;
-            break;
+            delta.rx_bytes += calc_per_sec_rate(raw_delta, time_delta_jiffies);
         }
     }
 
     read_unlock_irqrestore(&netdev_monitor_rwlock, flags);
-
-    if (!found) {
-        printk(KERN_WARNING "traffic_monitor: Device %s not found in monitor list\n", ifname);
-    }
 
     return delta;
 }
 
 /**
- * netdevice_stats_delta_all - Get aggregate per-second traffic for all devices
+ * traffic_netdev_event - Network device event handler for monitoring management
+ * @nb: Notifier block (unused, but required by notifier interface)
+ * @event: Network device event type
+ * @ptr: Event data pointer containing device information
  *
- * This function calculates the aggregate per-second rate of change for basic
- * traffic statistics across all monitored network devices.
+ * Handles network device lifecycle events to automatically manage the
+ * monitoring of target devices. The handler monitors device state changes
+ * and ensures that only devices listed in target_devices are tracked,
+ * providing automatic registration and cleanup without manual intervention.
  *
- * Context: Any context. Uses spinlock_irqsave for protection.
+ * The function handles three critical events:
+ * - NETDEV_UP: Device becomes available, starts monitoring if it's a target
+ * - NETDEV_GOING_DOWN: Normal shutdown, removes device from monitoring
+ * - NETDEV_UNREGISTER: Emergency cleanup for abnormal device removal scenarios
  *
- * Return: struct simple_net_device_stats containing aggregate per-second rates
- *         for all monitored devices.
- */
-struct simple_net_device_stats netdevice_stats_delta_all(void)
-{
-    struct simple_net_device_stats total_delta;
-    struct netdev_monitor_entry *entry;
-    unsigned long flags;
-    int bkt;
-    unsigned long device_delta, time_delta_jiffies;
-
-    memset(&total_delta, 0, sizeof(total_delta));
-
-    read_lock_irqsave(&netdev_monitor_rwlock, flags);
-
-    hash_for_each(netdev_monitor_hash, bkt, entry, hash_node) {
-        // Calculate time delta for this device
-        if (entry->current_stats_jiffies >= entry->prev_stats_jiffies) {
-            time_delta_jiffies = entry->current_stats_jiffies - entry->prev_stats_jiffies;
-        } else {
-            time_delta_jiffies = (ULONG_MAX - entry->prev_stats_jiffies) + entry->current_stats_jiffies + 1;
-        }
-
-        // Add per-second rates to total
-        device_delta = calc_delta_with_overflow(entry->current_stats.tx_packets, entry->prev_stats.tx_packets);
-        total_delta.tx_packets += calc_per_sec_rate(device_delta, time_delta_jiffies);
-
-        device_delta = calc_delta_with_overflow(entry->current_stats.tx_bytes, entry->prev_stats.tx_bytes);
-        total_delta.tx_bytes += calc_per_sec_rate(device_delta, time_delta_jiffies);
-
-        device_delta = calc_delta_with_overflow(entry->current_stats.rx_packets, entry->prev_stats.rx_packets);
-        total_delta.rx_packets += calc_per_sec_rate(device_delta, time_delta_jiffies);
-
-        device_delta = calc_delta_with_overflow(entry->current_stats.rx_bytes, entry->prev_stats.rx_bytes);
-        total_delta.rx_bytes += calc_per_sec_rate(device_delta, time_delta_jiffies);
-    }
-
-    read_unlock_irqrestore(&netdev_monitor_rwlock, flags);
-
-    return total_delta;
-}
-
-/**
- * traffic_netdev_event - Network device event handler
- * @nb: Notifier block
- * @event: Event type
- * @ptr: Event data pointer
+ * The dual cleanup approach (GOING_DOWN + UNREGISTER) ensures robust device
+ * reference management even when devices are removed unexpectedly, such as
+ * during physical device removal, network namespace deletion, driver errors,
+ * or virtual device destruction.
  *
- * This function handles network device events and automatically registers
- * or unregisters devices for monitoring based on the target device list.
- * Handles both normal shutdown (NETDEV_GOING_DOWN) and emergency cleanup
- * (NETDEV_UNREGISTER) to ensure proper device reference management.
- *
- * Context: Any context.
- *
- * Return: NOTIFY_DONE
+ * Context: Atomic context (notifier callback). Cannot sleep.
+ *          Respects monitor_stop_flag for safe module cleanup.
+ * Return: NOTIFY_DONE to continue notifier chain processing
  */
 static int traffic_netdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
 {
     struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+
+    // Check stop flag first - ignore events during module cleanup
+    if (atomic_read(&monitor_stop_flag))
+        return NOTIFY_DONE;
 
     // Only handle events for target devices
     if (!is_target_device(dev->name))
@@ -575,8 +688,18 @@ static int traffic_netdev_event(struct notifier_block *nb, unsigned long event, 
 }
 
 /**
- * @var traffic_netdev_notifier
- * @brief Netdevice notifier block for automatic monitoring
+ * traffic_netdev_notifier - Network device notifier for automatic monitoring
+ *
+ * Notifier block structure that registers the traffic monitoring system
+ * with the kernel's network device notification chain. This enables
+ * automatic detection and handling of network device lifecycle events
+ * such as device registration, state changes, and removal.
+ *
+ * The notifier uses default priority (0) to ensure it runs with normal
+ * precedence in the notification chain. The handler function automatically
+ * adds target devices to monitoring when they become available and removes
+ * them when they go down or are unregistered, providing seamless monitoring
+ * management without manual intervention.
  */
 static struct notifier_block traffic_netdev_notifier = {
     .notifier_call = traffic_netdev_event,
@@ -584,13 +707,25 @@ static struct notifier_block traffic_netdev_notifier = {
 };
 
 /**
- * traffic_monitor_cleanup - Clean up all monitored devices
+ * traffic_monitor_cleanup - Clean up all monitored devices and resources
  *
- * This function removes all devices from the monitoring hash table,
- * releases device references, and frees all allocated memory.
- * Called during module cleanup.
+ * Performs complete cleanup of the traffic monitoring subsystem by removing
+ * all devices from the monitoring hash table and releasing associated resources.
+ * The function safely iterates through all hash table entries, removes them
+ * from the table, releases the network device references that were acquired
+ * during registration, and frees the allocated memory for monitoring entries.
  *
- * Context: Process context.
+ * The cleanup process uses hash_for_each_safe() to allow safe removal of
+ * entries during iteration. After cleanup, the active monitor count is
+ * reset to zero to reflect the empty state of the monitoring system.
+ *
+ * This function is typically called during module unloading to ensure
+ * proper resource cleanup and prevent memory leaks or dangling device
+ * references.
+ *
+ * Context: Process context. Uses write lock with IRQ disable to ensure
+ *          exclusive access during the cleanup process and prevent
+ *          concurrent modifications.
  */
 static void traffic_monitor_cleanup(void)
 {
@@ -615,11 +750,23 @@ static void traffic_monitor_cleanup(void)
 /**
  * init_traffic_monitor - Initialize the traffic monitoring module
  *
- * This function initializes hash tables, registers the netdevice notifier,
- * and sets up the delayed work for periodic monitoring.
+ * Performs complete initialization of the traffic monitoring subsystem
+ * including data structures, work queues, and event notification registration.
+ * The function sets up all necessary components for automatic network device
+ * monitoring and ensures the system is ready to track target devices.
  *
- * Context: Process context during module load.
+ * The initialization sequence includes:
+ * - Hash table initialization for device storage
+ * - Stop flag reset to enable monitoring (critical for module reload scenarios)
+ * - Delayed work queue setup for periodic statistics collection
+ * - Network device notifier registration for automatic device management
  *
+ * If netdevice notifier registration fails, the function performs cleanup
+ * and returns an error code. The notifier registration is the critical step
+ * that enables automatic detection of target devices becoming available.
+ *
+ * Context: Process context during module loading. Can sleep due to
+ *          potential memory allocations in notifier registration.
  * Return: 0 on success, negative error code on failure
  */
 int init_traffic_monitor(void)
@@ -651,10 +798,26 @@ int init_traffic_monitor(void)
 /**
  * cleanup_traffic_monitor - Clean up the traffic monitoring module
  *
- * This function cleans up all resources and unregisters the netdevice
- * notifier when the module is unloaded.
+ * Performs complete shutdown and cleanup of the traffic monitoring subsystem
+ * during module unloading. The function follows a carefully ordered sequence
+ * to ensure safe termination of all monitoring activities and proper resource
+ * cleanup without race conditions or resource leaks.
  *
- * Context: Process context during module unload.
+ * The cleanup sequence is critical for safe shutdown:
+ * 1. Set stop flag to prevent new work scheduling and signal termination
+ * 2. Memory barrier to ensure stop flag visibility across all CPUs
+ * 3. Unregister netdevice notifier to stop receiving device events
+ * 4. Cancel and wait for completion of any pending delayed work
+ * 5. Clean up all monitored devices and release their resources
+ * 6. Perform any additional target device cleanup
+ *
+ * The use of cancel_delayed_work_sync() ensures that any running work
+ * handler completes before proceeding with device cleanup, preventing
+ * use-after-free scenarios. The memory barrier guarantees that the stop
+ * flag is visible to all CPUs before other cleanup operations begin.
+ *
+ * Context: Process context during module unloading. May sleep due to
+ *          synchronous work cancellation and potential cleanup operations.
  */
 void cleanup_traffic_monitor(void)
 {
