@@ -3,9 +3,50 @@
 
 #include <linux/types.h>
 
+/**
+ * TRAFFIC_STATS_TO_MBPS - Convert bytes per second to megabits per second
+ * @bytes_per_sec: Traffic rate in bytes per second
+ *
+ * Converts a traffic rate from bytes per second to megabits per second (Mbps).
+ * The conversion multiplies by 8 to convert bytes to bits, then divides by
+ * 1,000,000 to convert to megabits.
+ *
+ * Return: Traffic rate in megabits per second
+ */
 #define TRAFFIC_STATS_TO_MBPS(bytes_per_sec) ((bytes_per_sec) * 8 / 1000000ULL)
+
+/**
+ * TRAFFIC_STATS_TO_KBPS - Convert bytes per second to kilobits per second
+ * @bytes_per_sec: Traffic rate in bytes per second
+ *
+ * Converts a traffic rate from bytes per second to kilobits per second (Kbps).
+ * The conversion multiplies by 8 to convert bytes to bits, then divides by
+ * 1,000 to convert to kilobits.
+ *
+ * Return: Traffic rate in kilobits per second
+ */
 #define TRAFFIC_STATS_TO_KBPS(bytes_per_sec) ((bytes_per_sec) * 8 / 1000ULL)  
+
+/**
+ * TRAFFIC_STATS_TO_MPPS - Convert packets per second to megapackets per second
+ * @packets_per_sec: Traffic rate in packets per second
+ *
+ * Converts a traffic rate from packets per second to megapackets per second (Mpps).
+ * The conversion divides by 1,000,000 to convert to megapackets.
+ *
+ * Return: Traffic rate in megapackets per second
+ */
 #define TRAFFIC_STATS_TO_MPPS(packets_per_sec) ((packets_per_sec) / 1000000ULL)
+
+/**
+ * TRAFFIC_STATS_TO_KPPS - Convert packets per second to kilopackets per second
+ * @packets_per_sec: Traffic rate in packets per second
+ *
+ * Converts a traffic rate from packets per second to kilopackets per second (Kpps).
+ * The conversion divides by 1,000 to convert to kilopackets.
+ *
+ * Return: Traffic rate in kilopackets per second
+ */
 #define TRAFFIC_STATS_TO_KPPS(packets_per_sec) ((packets_per_sec) / 1000ULL)
 
 /**
@@ -37,8 +78,6 @@ struct simple_net_device_stats {
     unsigned long rx_packets;    /**< Received packets per second */
     unsigned long rx_bytes;      /**< Received bytes per second */
 };
-
-/* Function prototypes for kernel modules */
 
 /**
  * init_traffic_monitor - Initialize the traffic monitoring subsystem
