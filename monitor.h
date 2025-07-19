@@ -25,13 +25,27 @@
  * - Statistics collection for monitoring performance
  */
 
-/** Monitor library version */
-#define MONITOR_VERSION "1.0.0"
-
 /** Default monitoring interval in milliseconds */
 #define DEFAULT_MONITOR_INTERVAL_MS 1000
 /** Default hysteresis value (no hysteresis) */
 #define DEFAULT_HYSTERESIS 0
+
+/* Debug and logging macros */
+#ifdef DEBUG
+#define monitor_debug(fmt, ...) \
+    printk(KERN_DEBUG "monitor: " fmt "\n", ##__VA_ARGS__)
+#else
+#define monitor_debug(fmt, ...) do { } while (0)
+#endif
+
+#define monitor_info(fmt, ...) \
+    printk(KERN_INFO "monitor: " fmt "\n", ##__VA_ARGS__)
+
+#define monitor_warn(fmt, ...) \
+    printk(KERN_WARNING "monitor: " fmt "\n", ##__VA_ARGS__)
+
+#define monitor_err(fmt, ...) \
+    printk(KERN_ERR "monitor: " fmt "\n", ##__VA_ARGS__)
 
 /**
  * typedef monitor_func_t - Monitor function type
@@ -312,22 +326,5 @@ static inline bool monitor_state_changed_with_hysteresis(struct monitor_item *it
     
     return false;
 }
-
-/* Debug and logging macros */
-#ifdef DEBUG
-#define monitor_debug(fmt, ...) \
-    printk(KERN_DEBUG "monitor: " fmt "\n", ##__VA_ARGS__)
-#else
-#define monitor_debug(fmt, ...) do { } while (0)
-#endif
-
-#define monitor_info(fmt, ...) \
-    printk(KERN_INFO "monitor: " fmt "\n", ##__VA_ARGS__)
-
-#define monitor_warn(fmt, ...) \
-    printk(KERN_WARNING "monitor: " fmt "\n", ##__VA_ARGS__)
-
-#define monitor_err(fmt, ...) \
-    printk(KERN_ERR "monitor: " fmt "\n", ##__VA_ARGS__)
 
 #endif /* _MONITOR_H */
