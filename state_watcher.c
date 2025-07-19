@@ -1,4 +1,19 @@
 #include "state_watcher.h"
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/jiffies.h>
+
+#ifdef DEBUG
+#define STATE_WATCHER_DEBUG(fmt, ...) \
+    printk(KERN_DEBUG "wlbt: state_watcher: " fmt "\n", ##__VA_ARGS__)
+#else
+#define STATE_WATCHER_DEBUG(fmt, ...) do { } while (0)
+#endif
+#define STATE_WATCHER_INFO(fmt, ...) \
+    printk(KERN_INFO "wlbt: state_watcher: " fmt "\n", ##__VA_ARGS__)
+
+#define STATE_WATCHER_ERR(fmt, ...) \
+    printk(KERN_ERR "wlbt: state_watcher: " fmt "\n", ##__VA_ARGS__)
 
 /**
  * state_watcher_state_changed_with_hysteresis() - Check if state has changed with hysteresis
@@ -38,7 +53,7 @@ static bool state_watcher_state_changed_with_hysteresis(struct watch_item *item,
     /* Check if this matches the candidate state */
     if (item->candidate_state == new_state) {
         item->consecutive_count++;
-        state_watcher_debug("Item %s: consecutive count %lu for state %lu (need %lu)",
+        STATE_WATCHER_DEBUG("Item %s: consecutive count %lu for state %lu (need %lu)",
                            item->name, item->consecutive_count, new_state, item->hysteresis);
 
         /* Hysteresis threshold reached - trigger action */
@@ -50,7 +65,7 @@ static bool state_watcher_state_changed_with_hysteresis(struct watch_item *item,
         /* New candidate state - reset counter */
         item->candidate_state = new_state;
         item->consecutive_count = 1;
-        state_watcher_debug("Item %s: new candidate state %lu (count 1, need %lu)",
+        STATE_WATCHER_DEBUG("Item %s: new candidate state %lu (count 1, need %lu)",
                            item->name, new_state, item->hysteresis);
     }
 
@@ -79,7 +94,7 @@ static void state_watcher_work_func(struct work_struct *work)
     unsigned long current_time = jiffies;
     unsigned long flags;
 
-    if (!watcher->running) {
+    if (!READ_ONCE(watcher->running)) {
         return;
     }
 
@@ -95,7 +110,7 @@ static void state_watcher_work_func(struct work_struct *work)
             /* Check if forced state has expired */
             if (item->is_forced && time_after(current_time, item->forced_state_expire_time)) {
                 item->is_forced = false;
-                state_watcher_debug("Item %s: forced state expired, resuming normal watching",
+                STATE_WATCHER_DEBUG("Item %s: forced state expired, resuming normal watching",
                                    item->name);
             }
 
@@ -110,11 +125,11 @@ static void state_watcher_work_func(struct work_struct *work)
                 /* Use forced state if active, otherwise use state result */
                 if (item->is_forced) {
                     new_state = item->forced_state;
-                    state_watcher_debug("Item %s: using forced state %lu (state func returned %lu)", 
+                    STATE_WATCHER_DEBUG("Item %s: using forced state %lu (state func returned %lu)", 
                                        item->name, new_state, state_result);
                 } else {
                     new_state = state_result;
-                    state_watcher_debug("Item %s: state %lu -> %lu", 
+                    STATE_WATCHER_DEBUG("Item %s: state %lu -> %lu", 
                                        item->name, item->current_state, new_state);
                 }
 
@@ -122,7 +137,7 @@ static void state_watcher_work_func(struct work_struct *work)
                 if (item->is_forced) {
                     /* For forced state, ignore hysteresis and trigger action immediately */
                     state_changed = (item->last_action_state != new_state);
-                    state_watcher_debug("Item %s: forced state bypass hysteresis, state change %lu -> %lu",
+                    STATE_WATCHER_DEBUG("Item %s: forced state bypass hysteresis, state change %lu -> %lu",
                                        item->name, item->last_action_state, new_state);
                 } else {
                     /* Normal hysteresis checking */
@@ -135,7 +150,7 @@ static void state_watcher_work_func(struct work_struct *work)
                         /* Release spinlock before calling action (may sleep) */
                         spin_unlock_irqrestore(&watcher->lock, flags);
 
-                        state_watcher_debug("Item %s: executing action, state change %lu -> %lu",
+                        STATE_WATCHER_DEBUG("Item %s: executing action, state change %lu -> %lu",
                                            item->name, item->last_action_state, new_state);
 
                         item->action_func(item->last_action_state, new_state, item->private_data);
@@ -143,7 +158,7 @@ static void state_watcher_work_func(struct work_struct *work)
                         spin_lock_irqsave(&watcher->lock, flags);
 
                         /* List might have changed - recheck watcher state */
-                        if (!watcher->running) {
+                        if (!READ_ONCE(watcher->running)) {
                             spin_unlock_irqrestore(&watcher->lock, flags);
                             return;
                         }
@@ -163,7 +178,7 @@ static void state_watcher_work_func(struct work_struct *work)
     spin_unlock_irqrestore(&watcher->lock, flags);
 
     /* Schedule next execution */
-    if (watcher->running) {
+    if (READ_ONCE(watcher->running)) {
         schedule_delayed_work(&watcher->work, msecs_to_jiffies(watcher->base_interval_ms));
     }
 }
@@ -197,7 +212,7 @@ int state_watcher_init(struct state_watcher *watcher, unsigned long base_interva
     watcher->running = false;
     watcher->initialized = true;
 
-    state_watcher_info("State watcher initialized with base interval %lu ms", 
+    STATE_WATCHER_INFO("State watcher initialized with base interval %lu ms", 
                        watcher->base_interval_ms);
 
     return 0;
@@ -232,7 +247,7 @@ int state_watcher_force_state(struct watch_item *item, unsigned long forced_stat
     item->forced_state_expire_time = current_time + msecs_to_jiffies(duration_ms);
     item->is_forced = true;
 
-    state_watcher_info("Item %s: forced state %lu for %lu ms", 
+    STATE_WATCHER_INFO("Item %s: forced state %lu for %lu ms", 
                        item->name, forced_state, duration_ms);
 
     return 0;
@@ -256,7 +271,7 @@ int state_watcher_clear_forced_state(struct watch_item *item)
 
     if (item->is_forced) {
         item->is_forced = false;
-        state_watcher_info("Item %s: forced state cleared, resuming normal watching", 
+        STATE_WATCHER_INFO("Item %s: forced state cleared, resuming normal watching", 
                            item->name);
     }
 
@@ -286,7 +301,7 @@ bool state_watcher_is_state_forced(struct watch_item *item, unsigned long *remai
     /* Check if forced state has expired */
     if (item->is_forced && time_after(current_time, item->forced_state_expire_time)) {
         item->is_forced = false;
-        state_watcher_debug("Item %s: forced state expired during check", item->name);
+        STATE_WATCHER_DEBUG("Item %s: forced state expired during check", item->name);
     }
 
     if (item->is_forced && remaining_ms) {
@@ -329,7 +344,7 @@ void state_watcher_cleanup(struct state_watcher *watcher)
 
     watcher->initialized = false;
 
-    state_watcher_info("State watcher cleaned up");
+    STATE_WATCHER_INFO("State watcher cleaned up");
 }
 
 /**
@@ -349,14 +364,15 @@ int state_watcher_start(struct state_watcher *watcher)
         return -EINVAL;
     }
 
-    if (watcher->running) {
+    /* Atomic test-and-set */
+    if (cmpxchg(&watcher->running, false, true) != false) {
         return -EALREADY;
     }
 
-    watcher->running = true;
+    /* running=true is already visible due to cmpxchg barrier semantics */
     schedule_delayed_work(&watcher->work, msecs_to_jiffies(watcher->base_interval_ms));
 
-    state_watcher_info("State watcher started");
+    STATE_WATCHER_INFO("State watcher started");
     return 0;
 }
 
@@ -376,10 +392,16 @@ void state_watcher_stop(struct state_watcher *watcher)
         return;
     }
 
-    watcher->running = false;
+    /* Atomic test-and-clear */
+    if (cmpxchg(&watcher->running, true, false) != true) {
+        /* Already stopped */
+        return;
+    }
+
+    /* cmpxchg has implicit memory barrier semantics */
     cancel_delayed_work_sync(&watcher->work);
 
-    state_watcher_info("State watcher stopped");
+    STATE_WATCHER_INFO("State watcher stopped");
 }
 
 /**
@@ -414,14 +436,14 @@ struct watch_item *state_watcher_add_item(struct state_watcher *watcher,
 
     /* interval_ms must be multiple of base_interval_ms */
     if (interval_ms % watcher->base_interval_ms != 0) {
-        state_watcher_err("Invalid interval %lu ms: must be multiple of base interval %lu ms",
+        STATE_WATCHER_ERR("Invalid interval %lu ms: must be multiple of base interval %lu ms",
                          interval_ms, watcher->base_interval_ms);
         return NULL;
     }
 
     /* interval_ms must be >= base_interval_ms */
     if (interval_ms < watcher->base_interval_ms) {
-        state_watcher_err("Invalid interval %lu ms: must be >= base interval %lu ms",
+        STATE_WATCHER_ERR("Invalid interval %lu ms: must be >= base interval %lu ms",
                          interval_ms, watcher->base_interval_ms);
         return NULL;
     }
@@ -472,7 +494,7 @@ struct watch_item *state_watcher_add_item(struct state_watcher *watcher,
 
     spin_unlock_irqrestore(&watcher->lock, flags);
 
-    state_watcher_info("Added watch item '%s' (addr:%p, interval:%lu ms, hysteresis:%lu)",
+    STATE_WATCHER_INFO("Added watch item '%s' (addr:%p, interval:%lu ms, hysteresis:%lu)",
                        item->name, item, item->interval_ms, item->hysteresis);
 
     return item;
@@ -505,7 +527,7 @@ int state_watcher_remove_item(struct state_watcher *watcher, struct watch_item *
 
     spin_unlock_irqrestore(&watcher->lock, flags);
 
-    state_watcher_info("Removed watch item '%s' (addr:%p)", item->name, item);
+    STATE_WATCHER_INFO("Removed watch item '%s' (addr:%p)", item->name, item);
     kfree(item);
 
     return 0;

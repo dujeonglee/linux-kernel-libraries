@@ -1,3 +1,4 @@
+#include "traffic_monitor.h"
 #include <linux/kernel.h>
 #include <linux/netdevice.h>
 #include <linux/hashtable.h>
@@ -787,7 +788,6 @@ int init_traffic_monitor(void)
     ret = register_netdevice_notifier(&traffic_netdev_notifier);
     if (ret) {
         printk(KERN_ERR "traffic_monitor: Failed to register netdevice notifier: %d\n", ret);
-        cleanup_target_devices();
         return ret;
     }
     
@@ -835,9 +835,6 @@ void cleanup_traffic_monitor(void)
     
     // Clean up all monitored devices
     traffic_monitor_cleanup();
-    
-    // Clean up target devices
-    cleanup_target_devices();
     
     printk(KERN_INFO "traffic_monitor: Traffic monitoring module cleaned up\n");
 }
