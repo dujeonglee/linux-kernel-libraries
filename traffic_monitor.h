@@ -4,6 +4,31 @@
 #include <linux/types.h>
 
 /**
+ * DOC: Traffic Monitor Module Overview
+ *
+ * The Traffic Monitor Module provides automatic network device traffic
+ * statistics monitoring with real-time rate calculations. It tracks packet
+ * and byte counters for registered network interfaces and converts raw
+ * statistics into meaningful per-second rates with overflow protection.
+ *
+ * Key features:
+ * - Automatic target device detection and registration
+ * - Periodic statistics collection with configurable intervals
+ * - Overflow-safe delta calculations for counters and timestamps
+ * - Per-device and aggregate traffic rate reporting
+ * - Event-driven device lifecycle management
+ * - Thread-safe hash table operations with read-write locks
+ * - Clean resource management and module cleanup
+ * - Support for both individual device and system-wide queries
+ *
+ * The module automatically monitors predefined network interfaces,
+ * collecting statistics at regular intervals and providing APIs to
+ * retrieve current traffic rates in packets/second and bytes/second.
+ * All operations are designed to handle counter overflows and provide
+ * accurate rate calculations regardless of sampling intervals.
+ */
+
+/**
  * TRAFFIC_STATS_TO_MBPS - Convert bytes per second to megabits per second
  * @bytes_per_sec: Traffic rate in bytes per second
  *
