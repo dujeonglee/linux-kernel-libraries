@@ -43,10 +43,13 @@ static const char* target_devices[] = {
 DECLARE_HASHTABLE(netdev_monitor_hash, NETDEV_HASH_BITS);
 
 /**
- * @var netdev_monitor_lock
- * @brief Spinlock for protecting monitor hash table operations
+ * @var netdev_monitor_rwlock
+ * @brief RW lock for protecting monitor hash table operations
+ * Read lock: Used for querying statistics (delta functions)
+ * Write lock: Used for modifying hash table structure and updating stats
  */
-static DEFINE_SPINLOCK(netdev_monitor_lock);
+static DEFINE_RWLOCK(netdev_monitor_rwlock);
+
 
 /**
  * @var monitor_work
@@ -160,13 +163,13 @@ static int register_monitor_netdevice(const char* ifname)
         return -ENODEV;
     }
 
-    spin_lock_irqsave(&netdev_monitor_lock, flags);
+    write_lock_irqsave(&netdev_monitor_rwlock, flags);
 
     // Check if already registered
     hash_key = full_name_hash(NULL, ifname, strlen(ifname));
     hash_for_each_possible(netdev_monitor_hash, existing, hash_node, hash_key) {
         if (strcmp(existing->ifname, ifname) == 0) {
-            spin_unlock_irqrestore(&netdev_monitor_lock, flags);
+            write_unlock_irqrestore(&netdev_monitor_rwlock, flags);
             dev_put(dev);
             printk(KERN_INFO "traffic_monitor: Device %s already registered\n", ifname);
             return -EEXIST;
@@ -176,7 +179,7 @@ static int register_monitor_netdevice(const char* ifname)
     // Create new entry
     entry = kmalloc(sizeof(*entry), GFP_ATOMIC);
     if (!entry) {
-        spin_unlock_irqrestore(&netdev_monitor_lock, flags);
+        write_unlock_irqrestore(&netdev_monitor_rwlock, flags);
         dev_put(dev);
         return -ENOMEM;
     }
@@ -191,7 +194,7 @@ static int register_monitor_netdevice(const char* ifname)
     // Add to hash table
     hash_add(netdev_monitor_hash, &entry->hash_node, hash_key);
 
-    spin_unlock_irqrestore(&netdev_monitor_lock, flags);
+    write_unlock_irqrestore(&netdev_monitor_rwlock, flags);
 
     atomic_inc(&active_monitors);
 
@@ -223,7 +226,7 @@ static int unregister_monitor_netdevice(const char* ifname)
     if (!ifname)
         return -EINVAL;
 
-    spin_lock_irqsave(&netdev_monitor_lock, flags);
+    write_lock_irqsave(&netdev_monitor_rwlock, flags);
 
     hash_key = full_name_hash(NULL, ifname, strlen(ifname));
     hash_for_each_possible(netdev_monitor_hash, entry, hash_node, hash_key) {
@@ -236,7 +239,7 @@ static int unregister_monitor_netdevice(const char* ifname)
         }
     }
 
-    spin_unlock_irqrestore(&netdev_monitor_lock, flags);
+    write_unlock_irqrestore(&netdev_monitor_rwlock, flags);
 
     if (found) {
         atomic_dec(&active_monitors);
@@ -347,13 +350,13 @@ static void monitor_netdevices(void)
     int bkt;
     unsigned long update_jiffies = jiffies;
 
-    spin_lock_irqsave(&netdev_monitor_lock, flags);
+    write_lock_irqsave(&netdev_monitor_rwlock, flags);
 
     hash_for_each(netdev_monitor_hash, bkt, entry, hash_node) {
         update_device_stats(entry, update_jiffies);
     }
 
-    spin_unlock_irqrestore(&netdev_monitor_lock, flags);
+    write_unlock_irqrestore(&netdev_monitor_rwlock, flags);
 }
 
 /**
@@ -432,7 +435,7 @@ struct simple_net_device_stats netdevice_stats_delta_single(const char* ifname)
     if (!ifname)
         return delta;
 
-    spin_lock_irqsave(&netdev_monitor_lock, flags);
+    read_lock_irqsave(&netdev_monitor_rwlock, flags);
 
     hash_key = full_name_hash(NULL, ifname, strlen(ifname));
     hash_for_each_possible(netdev_monitor_hash, entry, hash_node, hash_key) {
@@ -462,7 +465,7 @@ struct simple_net_device_stats netdevice_stats_delta_single(const char* ifname)
         }
     }
 
-    spin_unlock_irqrestore(&netdev_monitor_lock, flags);
+    read_unlock_irqrestore(&netdev_monitor_rwlock, flags);
 
     if (!found) {
         printk(KERN_WARNING "traffic_monitor: Device %s not found in monitor list\n", ifname);
@@ -493,7 +496,7 @@ struct simple_net_device_stats netdevice_stats_delta_all(void)
 
     memset(&total_delta, 0, sizeof(total_delta));
 
-    spin_lock_irqsave(&netdev_monitor_lock, flags);
+    read_lock_irqsave(&netdev_monitor_rwlock, flags);
 
     hash_for_each(netdev_monitor_hash, bkt, entry, hash_node) {
         // Calculate time delta for this device
@@ -517,7 +520,7 @@ struct simple_net_device_stats netdevice_stats_delta_all(void)
         total_delta.rx_bytes += calc_per_sec_rate(device_delta, time_delta_jiffies);
     }
 
-    spin_unlock_irqrestore(&netdev_monitor_lock, flags);
+    read_unlock_irqrestore(&netdev_monitor_rwlock, flags);
 
     return total_delta;
 }
@@ -601,7 +604,7 @@ static void traffic_monitor_cleanup(void)
     unsigned long flags;
     int bkt;
     
-    spin_lock_irqsave(&netdev_monitor_lock, flags);
+    write_lock_irqsave(&netdev_monitor_rwlock, flags);
     
     hash_for_each_safe(netdev_monitor_hash, bkt, tmp, entry, hash_node) {
         hash_del(&entry->hash_node);
@@ -609,7 +612,7 @@ static void traffic_monitor_cleanup(void)
         kfree(entry);
     }
     
-    spin_unlock_irqrestore(&netdev_monitor_lock, flags);
+    write_unlock_irqrestore(&netdev_monitor_rwlock, flags);
     
     atomic_set(&active_monitors, 0);
 }
