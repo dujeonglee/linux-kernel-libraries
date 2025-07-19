@@ -199,50 +199,21 @@ void cleanup_traffic_monitor(void);
  * @code
  * struct simple_net_device_stats stats;
  * 
- * stats = netdevice_stats_delta_single("eth0");
+ * stats = netdevice_stats_delta("eth0");
  * if (stats.tx_packets > 0 || stats.rx_packets > 0) {
  *     printk("eth0 traffic: TX %lu pps/%lu bps, RX %lu pps/%lu bps\n",
  *            stats.tx_packets, stats.tx_bytes,
  *            stats.rx_packets, stats.rx_bytes);
  * }
+ *
+ * stats = netdevice_stats_delta(NULL);
+ * if (stats.tx_packets > 0 || stats.rx_packets > 0) {
+ *     printk("Total traffic: TX %lu pps/%lu bps, RX %lu pps/%lu bps\n",
+ *            stats.tx_packets, stats.tx_bytes,
+ *            stats.rx_packets, stats.rx_bytes);
+ * }
  * @endcode
  */
-struct simple_net_device_stats netdevice_stats_delta_single(const char* ifname);
-
-/**
- * netdevice_stats_delta_all - Get aggregate per-second traffic for all devices
- *
- * This function returns the aggregate per-second traffic statistics for all
- * currently monitored network devices. Each device's per-second rates are
- * calculated individually and then summed together.
- *
- * This is useful for getting overall system network activity across all
- * monitored interfaces. Only devices that are currently UP and being
- * monitored contribute to the aggregate statistics.
- *
- * Context: Any context (uses spinlock_irqsave for protection).
- * Locking: Takes netdev_monitor_lock internally.
- *
- * Return: struct simple_net_device_stats containing aggregate per-second
- *         rates for all monitored devices. All fields will be zero if:
- *         - No devices are currently monitored
- *         - All monitored devices have insufficient samples
- *         - No target devices are currently UP
- *
- * Example:
- * @code
- * struct simple_net_device_stats total_stats;
- * 
- * total_stats = netdevice_stats_delta_all();
- * printk("Total network activity: TX %lu pps/%lu bps, RX %lu pps/%lu bps\n",
- *        total_stats.tx_packets, total_stats.tx_bytes,
- *        total_stats.rx_packets, total_stats.rx_bytes);
- * 
- * // Calculate total throughput in Mbps
- * unsigned long total_mbps = (total_stats.tx_bytes + total_stats.rx_bytes) * 8 / 1000000;
- * printk("Total throughput: %lu Mbps\n", total_mbps);
- * @endcode
- */
-struct simple_net_device_stats netdevice_stats_delta_all(void);
+struct simple_net_device_stats netdevice_stats_delta(const char* ifname);
 
 #endif /* _TRAFFIC_MONITOR_H */

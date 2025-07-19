@@ -1,13 +1,9 @@
 #ifndef _STATE_WATCHER_H
 #define _STATE_WATCHER_H
 
-#include <linux/kernel.h>
-#include <linux/module.h>
 #include <linux/workqueue.h>
 #include <linux/list.h>
 #include <linux/spinlock.h>
-#include <linux/slab.h>
-#include <linux/jiffies.h>
 
 /**
  * DOC: State Watcher Library Overview
@@ -29,23 +25,6 @@
 #define DEFAULT_STATE_WATCHER_INTERVAL_MS 1000
 /** Default hysteresis value (no hysteresis) */
 #define DEFAULT_HYSTERESIS 0
-
-/* Debug and logging macros */
-#ifdef DEBUG
-#define state_watcher_debug(fmt, ...) \
-    printk(KERN_DEBUG "state_watcher: " fmt "\n", ##__VA_ARGS__)
-#else
-#define state_watcher_debug(fmt, ...) do { } while (0)
-#endif
-
-#define state_watcher_info(fmt, ...) \
-    printk(KERN_INFO "state_watcher: " fmt "\n", ##__VA_ARGS__)
-
-#define state_watcher_warn(fmt, ...) \
-    printk(KERN_WARNING "state_watcher: " fmt "\n", ##__VA_ARGS__)
-
-#define state_watcher_err(fmt, ...) \
-    printk(KERN_ERR "state_watcher: " fmt "\n", ##__VA_ARGS__)
 
 /**
  * typedef state_func_t - State function type
