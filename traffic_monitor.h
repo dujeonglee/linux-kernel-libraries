@@ -104,115 +104,19 @@ struct simple_net_device_stats {
     unsigned long rx_bytes;      /**< Received bytes per second */
 };
 
+
 /**
- * init_traffic_monitor - Initialize the traffic monitoring subsystem
- *
- * This function initializes the traffic monitoring module, sets up hash tables,
- * registers netdevice notifiers, and prepares delayed work for periodic
- * statistics collection. Must be called before using any other traffic
- * monitor functions.
- *
- * The function will:
- * - Initialize target device hash table with predefined device names
- * - Register netdevice notifier for automatic device registration
- * - Set up delayed work for periodic statistics updates
- * - Initialize all necessary locks and data structures
- *
- * Context: Process context during module initialization.
- * Locking: None required (called during init).
- *
- * Return: 
- * * 0 - Success
- * * -ENOMEM - Memory allocation failed
- * * -EBUSY - Notifier registration failed
- * 
- * Example:
- * @code
- * static int __init my_module_init(void)
- * {
- *     int ret = init_traffic_monitor();
- *     if (ret) {
- *         printk(KERN_ERR "Failed to initialize traffic monitor: %d\n", ret);
- *         return ret;
- *     }
- *     return 0;
- * }
- * @endcode
+ * init_traffic_monitor() - Initialize network traffic monitoring
  */
 int init_traffic_monitor(void);
 
 /**
- * cleanup_traffic_monitor - Clean up the traffic monitoring subsystem
- *
- * This function cleans up all resources used by the traffic monitoring
- * module. It unregisters the netdevice notifier, cancels delayed work,
- * releases all device references, and frees all allocated memory.
- * Should be called during module cleanup.
- *
- * The function will:
- * - Unregister netdevice notifier to stop receiving events
- * - Cancel and flush any pending delayed work
- * - Release all monitored device references
- * - Free all allocated memory and hash table entries
- * - Reset all counters and state
- *
- * Context: Process context during module cleanup.
- * Locking: Uses internal locks to ensure safe cleanup.
- *
- * Note: After calling this function, no other traffic monitor functions
- * should be used until init_traffic_monitor() is called again.
- *
- * Example:
- * @code
- * static void __exit my_module_exit(void)
- * {
- *     cleanup_traffic_monitor();
- * }
- * @endcode
+ * cleanup_traffic_monitor() - Clean up network traffic monitoring
  */
 void cleanup_traffic_monitor(void);
 
 /**
- * netdevice_stats_delta_single - Get per-second traffic statistics for one device
- * @ifname: Network interface name (e.g., "eth0", "wlan0")
- *
- * This function returns the per-second traffic statistics for the specified
- * network device. The statistics represent the rate of change between the
- * last two measurements taken by the monitoring subsystem.
- *
- * The device must be:
- * - Listed in the target devices configuration
- * - Currently UP and being monitored
- * - Have at least two measurement samples
- *
- * Context: Any context (uses spinlock_irqsave for protection).
- * Locking: Takes netdev_monitor_lock internally.
- *
- * Return: struct simple_net_device_stats containing per-second rates.
- *         All fields will be zero if:
- *         - Device is not found in monitor list
- *         - Device is not currently monitored
- *         - Insufficient measurement samples
- *         - Invalid interface name provided
- *
- * Example:
- * @code
- * struct simple_net_device_stats stats;
- * 
- * stats = netdevice_stats_delta("eth0");
- * if (stats.tx_packets > 0 || stats.rx_packets > 0) {
- *     printk("eth0 traffic: TX %lu pps/%lu bps, RX %lu pps/%lu bps\n",
- *            stats.tx_packets, stats.tx_bytes,
- *            stats.rx_packets, stats.rx_bytes);
- * }
- *
- * stats = netdevice_stats_delta(NULL);
- * if (stats.tx_packets > 0 || stats.rx_packets > 0) {
- *     printk("Total traffic: TX %lu pps/%lu bps, RX %lu pps/%lu bps\n",
- *            stats.tx_packets, stats.tx_bytes,
- *            stats.rx_packets, stats.rx_bytes);
- * }
- * @endcode
+ * netdevice_stats_delta() - Get network device statistics delta
  */
 struct simple_net_device_stats netdevice_stats_delta(const char* ifname);
 

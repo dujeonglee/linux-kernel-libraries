@@ -519,29 +519,46 @@ static void start_monitoring(void)
 }
 
 /**
- * netdevice_stats_delta - Get per-second traffic delta for device(s)
- * @ifname: Network interface name, or NULL for all devices
+ * netdevice_stats_delta_single - Get per-second traffic statistics for one device
+ * @ifname: Network interface name (e.g., "eth0", "wlan0")
  *
- * Calculates the per-second rate of change for basic traffic statistics
- * (tx/rx packets and bytes). If ifname is provided, returns statistics
- * for that specific device. If ifname is NULL, returns aggregate statistics
- * for all monitored devices.
+ * This function returns the per-second traffic statistics for the specified
+ * network device. The statistics represent the rate of change between the
+ * last two measurements taken by the monitoring subsystem.
  *
- * The function performs overflow-safe delta calculations between current
- * and previous statistics snapshots, then converts the raw deltas to
- * per-second rates using the time difference between snapshots. Each
- * device may have different sampling intervals, so time-based normalization
- * ensures accurate rate calculations.
+ * The device must be:
+ * - Listed in the target devices configuration
+ * - Currently UP and being monitored
+ * - Have at least two measurement samples
  *
- * For single device queries, if the device is not found in the monitoring
- * table, all fields in the returned structure will be zero and a warning
- * message is logged.
+ * Context: Any context (uses spinlock_irqsave for protection).
+ * Locking: Takes netdev_monitor_lock internally.
  *
- * Context: Any context. Uses read lock with IRQ disable to protect
- *          hash table access during statistics calculation.
  * Return: struct simple_net_device_stats containing per-second rates.
- *         For single device: zero-filled structure if device not found.
- *         For all devices: aggregate rates across all monitored devices.
+ *         All fields will be zero if:
+ *         - Device is not found in monitor list
+ *         - Device is not currently monitored
+ *         - Insufficient measurement samples
+ *         - Invalid interface name provided
+ *
+ * Example:
+ * @code
+ * struct simple_net_device_stats stats;
+ * 
+ * stats = netdevice_stats_delta("eth0");
+ * if (stats.tx_packets > 0 || stats.rx_packets > 0) {
+ *     printk("eth0 traffic: TX %lu pps/%lu bps, RX %lu pps/%lu bps\n",
+ *            stats.tx_packets, stats.tx_bytes,
+ *            stats.rx_packets, stats.rx_bytes);
+ * }
+ *
+ * stats = netdevice_stats_delta(NULL);
+ * if (stats.tx_packets > 0 || stats.rx_packets > 0) {
+ *     printk("Total traffic: TX %lu pps/%lu bps, RX %lu pps/%lu bps\n",
+ *            stats.tx_packets, stats.tx_bytes,
+ *            stats.rx_packets, stats.rx_bytes);
+ * }
+ * @endcode
  */
 struct simple_net_device_stats netdevice_stats_delta(const char* ifname)
 {
@@ -749,26 +766,39 @@ static void traffic_monitor_cleanup(void)
 }
 
 /**
- * init_traffic_monitor - Initialize the traffic monitoring module
+ * init_traffic_monitor - Initialize the traffic monitoring subsystem
  *
- * Performs complete initialization of the traffic monitoring subsystem
- * including data structures, work queues, and event notification registration.
- * The function sets up all necessary components for automatic network device
- * monitoring and ensures the system is ready to track target devices.
+ * This function initializes the traffic monitoring module, sets up hash tables,
+ * registers netdevice notifiers, and prepares delayed work for periodic
+ * statistics collection. Must be called before using any other traffic
+ * monitor functions.
  *
- * The initialization sequence includes:
- * - Hash table initialization for device storage
- * - Stop flag reset to enable monitoring (critical for module reload scenarios)
- * - Delayed work queue setup for periodic statistics collection
- * - Network device notifier registration for automatic device management
+ * The function will:
+ * - Initialize target device hash table with predefined device names
+ * - Register netdevice notifier for automatic device registration
+ * - Set up delayed work for periodic statistics updates
+ * - Initialize all necessary locks and data structures
  *
- * If netdevice notifier registration fails, the function performs cleanup
- * and returns an error code. The notifier registration is the critical step
- * that enables automatic detection of target devices becoming available.
+ * Context: Process context during module initialization.
+ * Locking: None required (called during init).
  *
- * Context: Process context during module loading. Can sleep due to
- *          potential memory allocations in notifier registration.
- * Return: 0 on success, negative error code on failure
+ * Return: 
+ * * 0 - Success
+ * * -ENOMEM - Memory allocation failed
+ * * -EBUSY - Notifier registration failed
+ * 
+ * Example:
+ * @code
+ * static int __init my_module_init(void)
+ * {
+ *     int ret = init_traffic_monitor();
+ *     if (ret) {
+ *         printk(KERN_ERR "Failed to initialize traffic monitor: %d\n", ret);
+ *         return ret;
+ *     }
+ *     return 0;
+ * }
+ * @endcode
  */
 int init_traffic_monitor(void)
 {
@@ -796,28 +826,33 @@ int init_traffic_monitor(void)
 }
 
 /**
- * cleanup_traffic_monitor - Clean up the traffic monitoring module
+ * cleanup_traffic_monitor - Clean up the traffic monitoring subsystem
  *
- * Performs complete shutdown and cleanup of the traffic monitoring subsystem
- * during module unloading. The function follows a carefully ordered sequence
- * to ensure safe termination of all monitoring activities and proper resource
- * cleanup without race conditions or resource leaks.
+ * This function cleans up all resources used by the traffic monitoring
+ * module. It unregisters the netdevice notifier, cancels delayed work,
+ * releases all device references, and frees all allocated memory.
+ * Should be called during module cleanup.
  *
- * The cleanup sequence is critical for safe shutdown:
- * 1. Set stop flag to prevent new work scheduling and signal termination
- * 2. Memory barrier to ensure stop flag visibility across all CPUs
- * 3. Unregister netdevice notifier to stop receiving device events
- * 4. Cancel and wait for completion of any pending delayed work
- * 5. Clean up all monitored devices and release their resources
- * 6. Perform any additional target device cleanup
+ * The function will:
+ * - Unregister netdevice notifier to stop receiving events
+ * - Cancel and flush any pending delayed work
+ * - Release all monitored device references
+ * - Free all allocated memory and hash table entries
+ * - Reset all counters and state
  *
- * The use of cancel_delayed_work_sync() ensures that any running work
- * handler completes before proceeding with device cleanup, preventing
- * use-after-free scenarios. The memory barrier guarantees that the stop
- * flag is visible to all CPUs before other cleanup operations begin.
+ * Context: Process context during module cleanup.
+ * Locking: Uses internal locks to ensure safe cleanup.
  *
- * Context: Process context during module unloading. May sleep due to
- *          synchronous work cancellation and potential cleanup operations.
+ * Note: After calling this function, no other traffic monitor functions
+ * should be used until init_traffic_monitor() is called again.
+ *
+ * Example:
+ * @code
+ * static void __exit my_module_exit(void)
+ * {
+ *     cleanup_traffic_monitor();
+ * }
+ * @endcode
  */
 void cleanup_traffic_monitor(void)
 {
