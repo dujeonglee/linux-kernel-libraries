@@ -22,8 +22,17 @@
  * Copyright (C) 2025 Dujeong Lee <dujeong.lee82@gmail.com>
  */
 
-#include "kernel_watchdog.h"
+#include <linux/bug.h>
+#include <linux/errno.h>
+#include <linux/jiffies.h>
+#include <linux/kernel.h>
+#include <linux/limits.h>
+#include <linux/printk.h>
+#include <linux/slab.h>
+#include <linux/spinlock.h>
+#include <linux/string.h>
 
+#include "kernel_watchdog.h"
 /* Global watchdog context - single instance per system */
 static struct watchdog_context g_watchdog_ctx;
 
@@ -93,14 +102,49 @@ static void watchdog_work_func(struct work_struct *work)
 }
 
 /**
- * watchdog_init - Initialize the watchdog system
- *
- * Initializes the global watchdog context and prepares the system for
- * watchdog operations. No periodic work is started until the first
- * watchdog item is added, providing zero overhead when idle.
- *
- * Return: 0 on success, -EBUSY if already initialized
- */
+* watchdog_init - Initialize the watchdog system
+*
+* Initializes the global watchdog context and prepares the system for
+* watchdog operations. This function must be called before any other
+* watchdog operations can be performed.
+*
+* The initialization sets up the internal data structures but does not
+* start any periodic work. The work is started on-demand when the first
+* watchdog item is added, providing zero CPU overhead when the system
+* is idle.
+*
+* This function is safe to call multiple times - subsequent calls will
+* return -EBUSY without affecting the already initialized system.
+*
+* Context: Process context
+* Return: 0 on success, -EBUSY if already initialized
+*
+* Example:
+* @code
+* // Initialize the watchdog system during module init
+* static int __init my_module_init(void)
+* {
+*     int ret = watchdog_init();
+*     if (ret) {
+*         pr_err("Failed to initialize watchdog system: %d\n", ret);
+*         return ret;
+*     }
+*     
+*     // Now safe to use watchdog_add(), watchdog_start(), etc.
+*     return 0;
+* }
+* 
+* // Or during device probe
+* static int my_device_probe(struct platform_device *pdev)
+* {
+*     if (watchdog_init() && ret != -EBUSY) {
+*         dev_err(&pdev->dev, "Watchdog init failed\n");
+*         return -ENODEV;
+*     }
+*     // Continue with device initialization...
+* }
+* @endcode
+*/
 int watchdog_init(void)
 {
 	if (g_watchdog_ctx.initialized) {
@@ -124,15 +168,52 @@ int watchdog_init(void)
 }
 
 /**
- * watchdog_deinit - Deinitialize the watchdog system
- *
- * Stops all periodic work, removes and frees all watchdog items, and resets
- * the system to uninitialized state. This function is safe to call multiple
- * times and handles cleanup gracefully even if no items exist.
- *
- * All watchdog items are marked invalid before being freed to prevent
- * use-after-free issues if other code still holds references.
- */
+* watchdog_deinit - Deinitialize the watchdog system
+*
+* Stops all periodic work, removes and frees all watchdog items, and resets
+* the system to uninitialized state. This function performs complete cleanup
+* of the watchdog system and should be called during module exit or system
+* shutdown.
+*
+* The function safely handles cleanup even if watchdog items still exist,
+* marking them as invalid before freeing to prevent use-after-free issues
+* if other code still holds references to the items.
+*
+* This function is safe to call multiple times and handles cleanup gracefully
+* even if no items exist or the system was never initialized.
+*
+* After calling this function, watchdog_init() must be called again before
+* any watchdog operations can be performed.
+*
+* Context: Process context (may sleep due to work cancellation)
+*
+* Example:
+* @code
+* // During module exit
+* static void __exit my_module_exit(void)
+* {
+*     // Clean up any remaining watchdogs and deinitialize
+*     watchdog_deinit();
+* }
+* 
+* // During device removal
+* static int my_device_remove(struct platform_device *pdev)
+* {
+*     struct my_device *dev = platform_get_drvdata(pdev);
+*     
+*     // Cancel device-specific watchdog
+*     if (dev->watchdog) {
+*         watchdog_cancel(dev->watchdog);
+*         watchdog_remove(dev->watchdog);
+*     }
+*     
+*     // If this was the last device using watchdog system
+*     watchdog_deinit();
+*     
+*     return 0;
+* }
+* @endcode
+*/
 void watchdog_deinit(void)
 {
 	struct watchdog_item *item, *tmp;
@@ -161,25 +242,67 @@ void watchdog_deinit(void)
 }
 
 /**
- * watchdog_add - Add a new watchdog item
- * @timeout_ms: Timeout in milliseconds (must be >= WATCHDOG_MIN_TIMEOUT_MS)
- * @recovery_func: Function to call when timeout occurs (must not be NULL)
- * @private_data: Opaque pointer passed to recovery function (can be NULL)
- *
- * Creates a new watchdog item and adds it to the monitoring system. The
- * watchdog starts in inactive state; use watchdog_start() to begin monitoring.
- *
- * If this is the first watchdog item, the periodic work is automatically
- * started. If the timeout is shorter than existing items, the work period
- * is adjusted for better accuracy.
- *
- * The timeout must be at least WATCHDOG_MIN_TIMEOUT_MS milliseconds to
- * prevent excessive CPU usage. Shorter timeouts will trigger BUG() to
- * protect system stability.
- *
- * Return: Pointer to watchdog item on success, NULL on allocation failure,
- *         or BUG() if timeout_ms < WATCHDOG_MIN_TIMEOUT_MS
- */
+* watchdog_add - Add a new watchdog item to the monitoring system
+* @timeout_ms: Timeout value in milliseconds (must be >= WATCHDOG_MIN_TIMEOUT_MS)
+* @recovery_func: Function to call when timeout occurs (must not be NULL)
+* @private_data: Opaque pointer passed to recovery function (can be NULL)
+*
+* Creates a new watchdog item and adds it to the monitoring system. The
+* watchdog starts in inactive state; use watchdog_start() to begin monitoring.
+* The recovery function will be called repeatedly every work period after the
+* timeout occurs, until watchdog_cancel() or watchdog_remove() is called.
+*
+* If this is the first watchdog item, the periodic work is automatically
+* started. If the timeout is shorter than existing items, the work period
+* is dynamically adjusted for better accuracy.
+*
+* The @timeout_ms must be at least WATCHDOG_MIN_TIMEOUT_MS milliseconds to
+* prevent excessive CPU usage. Shorter timeouts will trigger BUG() to
+* protect system stability.
+*
+* The @recovery_func should be lightweight and non-blocking as it runs in
+* workqueue context with spinlocks temporarily released. It can perform
+* recovery actions like device resets, error logging, or state recovery.
+*
+* Context: Process context
+* Return: Pointer to watchdog item on success, NULL on allocation failure,
+*         or BUG() if timeout_ms < WATCHDOG_MIN_TIMEOUT_MS
+*
+* Example:
+* @code
+* // Recovery function for device timeout
+* void device_recovery(void *data)
+* {
+*     struct my_device *dev = (struct my_device *)data;
+*     
+*     dev_warn(&dev->pdev->dev, "Device timeout - attempting recovery\n");
+*     my_device_reset(dev);
+*     
+*     // Recovery function is called repeatedly until cancelled
+*     if (my_device_is_responsive(dev)) {
+*         // Cancel the watchdog once device recovers
+*         watchdog_cancel(dev->watchdog);
+*     }
+* }
+* 
+* // Add watchdog during device initialization
+* static int my_device_probe(struct platform_device *pdev)
+* {
+*     struct my_device *dev = devm_kzalloc(&pdev->dev, sizeof(*dev), GFP_KERNEL);
+*     
+*     // Add 5-second timeout watchdog
+*     dev->watchdog = watchdog_add(5000, device_recovery, dev);
+*     if (!dev->watchdog) {
+*         dev_err(&pdev->dev, "Failed to create watchdog\n");
+*         return -ENOMEM;
+*     }
+*     
+*     // Watchdog is created but not active yet
+*     // Use watchdog_start() when operation begins
+*     return 0;
+* }
+* @endcode
+*/
 struct watchdog_item *watchdog_add(unsigned long timeout_ms,
 				   void (*recovery_func)(void *data),
 				   void *private_data)
@@ -235,18 +358,74 @@ struct watchdog_item *watchdog_add(unsigned long timeout_ms,
 }
 
 /**
- * watchdog_remove - Remove and free a watchdog item
- * @item: Watchdog item to remove (must be valid pointer from watchdog_add)
- *
- * Removes the specified watchdog item from monitoring and frees its memory.
- * The item is marked invalid before removal to prevent use-after-free issues.
- *
- * If this was the last watchdog item, the periodic work is automatically
- * stopped to save CPU resources. If other items remain, the work period
- * may be adjusted based on the remaining shortest timeout.
- *
- * Return: 0 on success, negative error code on failure
- */
+* watchdog_remove - Remove and free a watchdog item from the monitoring system
+* @item: Watchdog item to remove (must be valid pointer from watchdog_add)
+*
+* Removes the specified watchdog item from monitoring and frees its memory.
+* The item is marked invalid before removal to prevent use-after-free issues
+* if other threads still hold references to it.
+*
+* If this was the last watchdog item, the periodic work is automatically
+* stopped to save CPU resources and achieve zero overhead. If other items
+* remain, the work period may be recalculated and adjusted based on the
+* remaining shortest timeout.
+*
+* It is safe to call this function on an active watchdog - it will be
+* automatically cancelled during removal. However, it's good practice to
+* call watchdog_cancel() explicitly before removal for clarity.
+*
+* After this function returns, the @item pointer becomes invalid and must
+* not be used for any further operations.
+*
+* Context: Process context (may sleep due to work rescheduling)
+* Return: 0 on success, -ENODEV if watchdog system not initialized,
+*         -EINVAL if @item is NULL or invalid
+*
+* Example:
+* @code
+* // Clean removal during device shutdown
+* static int my_device_remove(struct platform_device *pdev)
+* {
+*     struct my_device *dev = platform_get_drvdata(pdev);
+*     
+*     if (dev->watchdog) {
+*         // Good practice: explicitly cancel before removing
+*         watchdog_cancel(dev->watchdog);
+*         
+*         // Remove and free the watchdog
+*         int ret = watchdog_remove(dev->watchdog);
+*         if (ret) {
+*             dev_warn(&pdev->dev, "Failed to remove watchdog: %d\n", ret);
+*         }
+*         
+*         // Mark as removed to prevent double-free
+*         dev->watchdog = NULL;
+*     }
+*     
+*     return 0;
+* }
+* 
+* // Error handling during device initialization
+* static int my_device_probe(struct platform_device *pdev)
+* {
+*     struct my_device *dev;
+*     int ret;
+*     
+*     dev->watchdog = watchdog_add(2000, recovery_func, dev);
+*     if (!dev->watchdog)
+*         return -ENOMEM;
+*     
+*     ret = my_device_init_hardware(dev);
+*     if (ret) {
+*         // Clean up on error
+*         watchdog_remove(dev->watchdog);
+*         return ret;
+*     }
+*     
+*     return 0;
+* }
+* @endcode
+*/
 int watchdog_remove(struct watchdog_item *item)
 {
 	unsigned long flags;
@@ -288,25 +467,78 @@ int watchdog_remove(struct watchdog_item *item)
 }
 
 /**
- * watchdog_start - Start monitoring a watchdog item (Lock-free)
- * @item: Watchdog item to start (must be valid pointer from watchdog_add)
- *
- * Begins timeout monitoring for the specified watchdog item. If the watchdog
- * is not already active, records the current time as the start point and
- * activates monitoring. If already active, this call is ignored to prevent
- * timeout extension through repeated start calls.
- *
- * This "start-once" behavior ensures predictable timeout behavior:
- * - First watchdog_start() sets the timeout baseline
- * - Subsequent calls are ignored until watchdog_cancel() is called
- * - To restart timeout, must call watchdog_cancel() then watchdog_start()
- *
- * Memory barriers ensure that the start time is written before the active
- * flag is set, preventing race conditions where the work function might
- * see active=1 but an uninitialized start_time.
- *
- * Return: 0 on success, negative error code on failure
- */
+* watchdog_start - Start monitoring a watchdog item (Lock-free operation)
+* @item: Watchdog item to start (must be valid pointer from watchdog_add)
+*
+* Begins timeout monitoring for the specified watchdog item. If the watchdog
+* is not already active, records the current time as the start point and
+* activates monitoring. If already active, this call is ignored to prevent
+* timeout extension through repeated start calls.
+*
+* This "start-once" behavior ensures predictable timeout behavior:
+* - First watchdog_start() sets the timeout baseline using current jiffies
+* - Subsequent calls are ignored until watchdog_cancel() is called
+* - To restart timeout counting, must call watchdog_cancel() then watchdog_start()
+*
+* The operation is lock-free for maximum performance on hot paths, using
+* atomic operations and memory barriers to ensure thread safety. This makes
+* it suitable for use in interrupt contexts and performance-critical code paths.
+*
+* Once started, the recovery function will be called repeatedly every work
+* period after the timeout expires, until the watchdog is cancelled or removed.
+*
+* Context: Any context (atomic, interrupt-safe, lock-free)
+* Return: 0 on success, -ENODEV if watchdog system not initialized,
+*         -EINVAL if @item is NULL or invalid
+*
+* Example:
+* @code
+* // Start watchdog before critical operation
+* static int my_device_critical_operation(struct my_device *dev)
+* {
+*     int ret;
+*     
+*     // Start 3-second timeout before operation
+*     ret = watchdog_start(dev->watchdog);
+*     if (ret) {
+*         dev_err(&dev->pdev->dev, "Failed to start watchdog: %d\n", ret);
+*         return ret;
+*     }
+*     
+*     // Perform critical operation that might hang
+*     ret = my_device_send_command(dev, CRITICAL_CMD);
+*     
+*     // Cancel watchdog on successful completion
+*     if (ret == 0) {
+*         watchdog_cancel(dev->watchdog);
+*     }
+*     // If operation failed/hung, recovery function will be called
+*     
+*     return ret;
+* }
+* 
+* // Start-once behavior demonstration
+* watchdog_start(item);  // Sets timeout baseline at current time
+* msleep(50);
+* watchdog_start(item);  // Ignored - timeout still based on first call
+* msleep(50);
+* watchdog_cancel(item); // Reset the watchdog
+* watchdog_start(item);  // Now sets new timeout baseline
+* 
+* // Safe to call from interrupt context
+* static irqreturn_t my_irq_handler(int irq, void *data)
+* {
+*     struct my_device *dev = data;
+*     
+*     // Start watchdog for interrupt processing timeout
+*     watchdog_start(dev->irq_watchdog);
+*     
+*     // Process interrupt...
+*     
+*     return IRQ_HANDLED;
+* }
+* @endcode
+*/
 int watchdog_start(struct watchdog_item *item)
 {
 	if (!g_watchdog_ctx.initialized) {
@@ -340,15 +572,82 @@ int watchdog_start(struct watchdog_item *item)
 }
 
 /**
- * watchdog_cancel - Stop monitoring a watchdog item (Lock-free)
- * @item: Watchdog item to cancel (must be valid pointer from watchdog_add)
- *
- * Stops timeout monitoring for the specified watchdog item. The recovery
- * function will no longer be called for this item. This operation is
- * lock-free for maximum performance on hot paths.
- *
- * Return: 0 on success, negative error code on failure
- */
+* watchdog_cancel - Stop monitoring a watchdog item (Lock-free operation)
+* @item: Watchdog item to cancel (must be valid pointer from watchdog_add)
+*
+* Stops timeout monitoring for the specified watchdog item. The recovery
+* function will no longer be called for this item, even if it was previously
+* in timeout state and being called repeatedly.
+*
+* This operation immediately deactivates the watchdog by atomically clearing
+* the active flag. The watchdog can be restarted later using watchdog_start(),
+* which will establish a new timeout baseline from that point.
+*
+* The operation is lock-free for maximum performance on hot paths, using
+* atomic operations to ensure thread safety. This makes it suitable for use
+* in interrupt contexts, completion handlers, and performance-critical code paths.
+*
+* It is safe to call this function multiple times on the same item - subsequent
+* calls on an already cancelled watchdog have no effect.
+*
+* Context: Any context (atomic, interrupt-safe, lock-free)
+* Return: 0 on success, -ENODEV if watchdog system not initialized,
+*         -EINVAL if @item is NULL or invalid
+*
+* Example:
+* @code
+* // Cancel watchdog on successful operation completion
+* static int my_device_operation(struct my_device *dev)
+* {
+*     int ret;
+*     
+*     // Start 5-second timeout
+*     watchdog_start(dev->watchdog);
+*     
+*     ret = my_device_perform_operation(dev);
+*     
+*     if (ret == 0) {
+*         // Operation succeeded - cancel the watchdog
+*         watchdog_cancel(dev->watchdog);
+*         dev_dbg(&dev->pdev->dev, "Operation completed successfully\n");
+*     } else {
+*         // Operation failed - leave watchdog active for recovery
+*         dev_err(&dev->pdev->dev, "Operation failed, watchdog will trigger recovery\n");
+*     }
+*     
+*     return ret;
+* }
+* 
+* // Cancel from completion callback
+* static void my_async_completion(struct work_struct *work)
+* {
+*     struct my_device *dev = container_of(work, struct my_device, async_work);
+*     
+*     // Async operation completed - cancel timeout watchdog
+*     watchdog_cancel(dev->async_watchdog);
+*     
+*     // Process completion...
+* }
+* 
+* // Safe to call from interrupt context
+* static irqreturn_t my_completion_irq(int irq, void *data)
+* {
+*     struct my_device *dev = data;
+*     
+*     // Hardware signaled completion - cancel watchdog immediately
+*     watchdog_cancel(dev->hw_watchdog);
+*     
+*     return IRQ_HANDLED;
+* }
+* 
+* // Multiple cancels are safe
+* watchdog_start(item);
+* // ... some operation ...
+* watchdog_cancel(item);  // Cancels the watchdog
+* watchdog_cancel(item);  // Safe, no effect
+* watchdog_cancel(item);  // Safe, no effect
+* @endcode
+*/
 int watchdog_cancel(struct watchdog_item *item)
 {
 	if (!g_watchdog_ctx.initialized) {
@@ -374,24 +673,67 @@ int watchdog_cancel(struct watchdog_item *item)
 }
 
 /**
- * update_work_period - Update work period and start/stop work as needed
- *
- * This function calculates the optimal work period by finding the shortest
- * timeout among all valid watchdog items. The work period is set to half
- * the shortest timeout for accurate detection, but clamped to a maximum
- * of WATCHDOG_MAX_WORK_PERIOD_MS to prevent excessive CPU usage.
- *
- * Work scheduling behavior:
- * - If no valid items exist: stop work completely (zero CPU overhead)
- * - If items exist but work stopped: start work with calculated period  
- * - If period changed significantly: restart work with new period
- * - If period unchanged: no action (avoid unnecessary work cancellation)
- *
- * This function must be called whenever items are added or removed to
- * maintain optimal performance and accuracy.
- *
- * Context: Process context, may sleep due to work cancellation
- */
+* update_work_period - Update work period and start/stop work as needed
+*
+* This internal function calculates the optimal work period by finding the
+* shortest timeout among all valid watchdog items. The work period is set to
+* half the shortest timeout for accurate detection, but clamped to a maximum
+* frequency limit (WATCHDOG_MAX_WORK_PERIOD_MS) to prevent excessive CPU usage.
+*
+* Work scheduling behavior:
+* - If no valid items exist: stop work completely (zero CPU overhead)
+* - If items exist but work stopped: start work with calculated period
+* - If period changed significantly: restart work with new period
+* - If period unchanged: no action (avoid unnecessary work cancellation)
+*
+* The function automatically manages the work lifecycle based on the presence
+* and characteristics of watchdog items. This provides:
+* - Zero overhead when no watchdogs are active
+* - Optimal detection accuracy for the shortest timeout
+* - Protection against excessive CPU usage
+* - Automatic adaptation to changing timeout requirements
+*
+* This function must be called whenever items are added or removed to
+* maintain optimal performance and accuracy. It handles all the complexity
+* of work management internally, requiring no user intervention.
+*
+* Context: Process context (may sleep due to work cancellation)
+*
+* Example behavior:
+* @code
+* // Initially no items - no work running
+* // work_active = false, period_ms = 0
+* 
+* // Add first item with 2000ms timeout
+* watchdog_add(2000, func1, data1);
+* // update_work_period() called automatically
+* // period_ms = 1000ms (2000/2), work starts
+* 
+* // Add item with shorter 800ms timeout  
+* watchdog_add(800, func2, data2);
+* // update_work_period() called automatically
+* // period_ms = 400ms (800/2), work rescheduled
+* 
+* // Add item with very short 50ms timeout
+* watchdog_add(50, func3, data3);  // This would BUG() - too short
+* 
+* // Add item with 120ms timeout (above minimum)
+* watchdog_add(120, func3, data3);
+* // update_work_period() called automatically
+* // period_ms = 50ms (clamped to WATCHDOG_MAX_WORK_PERIOD_MS)
+* 
+* // Remove the 120ms item
+* watchdog_remove(item3);
+* // update_work_period() called automatically
+* // period_ms = 400ms (back to 800/2), work rescheduled
+* 
+* // Remove all items
+* watchdog_remove(item1);
+* watchdog_remove(item2);
+* // update_work_period() called automatically
+* // work_active = false, period_ms = 0, zero overhead achieved
+* @endcode
+*/
 static void update_work_period(void)
 {
 	struct watchdog_item *item;
