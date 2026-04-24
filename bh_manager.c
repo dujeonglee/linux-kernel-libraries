@@ -45,6 +45,13 @@
 #define BHM_DEFAULT_FALL_TICKS       10
 #define BHM_INVALID_LEVEL            ((u32)-1)
 
+/* timer_delete_sync() replaced del_timer_sync() in kernel v6.15. */
+#if KERNEL_VERSION(6, 15, 0) <= LINUX_VERSION_CODE
+#define bhm_timer_delete_sync(t)  timer_delete_sync(t)
+#else
+#define bhm_timer_delete_sync(t)  del_timer_sync(t)
+#endif
+
 /* -------------------------------------------------------------------------
  * Internal state
  * ---------------------------------------------------------------------- */
@@ -153,7 +160,7 @@ struct bhm_bh {
 	union {
 		struct {
 			struct napi_struct   napi;
-			struct net_device   *dev;      /* may be &g_mgr.dummy_dev */
+			struct net_device   *dev;      /* may be g_mgr.dummy_dev */
 			int                (*user_poll)(struct napi_struct *, int);
 			int                  weight;
 			bool                 threaded;
@@ -187,7 +194,14 @@ struct bhm_mgr {
 	enum cpuhp_state  cpuhp_state;
 	bool              cpuhp_registered;
 
-	struct net_device dummy_dev;       /* NAPI anchor when caller supplies none */
+	/* NAPI anchor when caller supplies no netdev. Allocated via
+	 * alloc_netdev_dummy() on v6.11+, otherwise initialized in-place
+	 * from the fallback storage below.
+	 */
+	struct net_device *dummy_dev;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
+	struct net_device dummy_dev_storage;
+#endif
 
 	u32               last_tput_tx;
 	u32               last_tput_rx;
@@ -200,6 +214,11 @@ static struct bhm_mgr g_mgr;
 /* -------------------------------------------------------------------------
  * Helpers
  * ---------------------------------------------------------------------- */
+
+/* Forward declarations for helpers used before their definitions. */
+static void bhm_bh_tput_locked(const struct bhm_bh *bh,
+				u32 *tx_bps, u32 *rx_bps);
+static int bhm_resolve_preferred_cpu(struct bhm_bh *bh);
 
 static inline bool bhm_level_is_periodic(const struct bhm_level *lv)
 {
@@ -631,7 +650,9 @@ static void bhm_timer_fn(struct timer_list *t)
 static void bhm_timer_fn(unsigned long data)
 #endif
 {
-#if KERNEL_VERSION(4, 15, 0) <= LINUX_VERSION_CODE
+#if KERNEL_VERSION(6, 16, 0) <= LINUX_VERSION_CODE
+	struct bhm_mgr *mgr = timer_container_of(mgr, t, timer);
+#elif KERNEL_VERSION(4, 15, 0) <= LINUX_VERSION_CODE
 	struct bhm_mgr *mgr = from_timer(mgr, t, timer);
 #else
 	struct bhm_mgr *mgr = (struct bhm_mgr *)data;
@@ -803,10 +824,24 @@ int bhm_init(void)
 	setup_timer(&g_mgr.timer, bhm_timer_fn, (unsigned long)&g_mgr);
 #endif
 
-	init_dummy_netdev(&g_mgr.dummy_dev);
+#if KERNEL_VERSION(6, 11, 0) <= LINUX_VERSION_CODE
+	g_mgr.dummy_dev = alloc_netdev_dummy(0);
+	if (!g_mgr.dummy_dev) {
+		destroy_workqueue(g_mgr.wq);
+		g_mgr.wq = NULL;
+		return -ENOMEM;
+	}
+#else
+	init_dummy_netdev(&g_mgr.dummy_dev_storage);
+	g_mgr.dummy_dev = &g_mgr.dummy_dev_storage;
+#endif
 
 	ret = bhm_cpuhp_register();
 	if (ret < 0) {
+#if KERNEL_VERSION(6, 11, 0) <= LINUX_VERSION_CODE
+		free_netdev(g_mgr.dummy_dev);
+		g_mgr.dummy_dev = NULL;
+#endif
 		destroy_workqueue(g_mgr.wq);
 		g_mgr.wq = NULL;
 		return ret;
@@ -827,7 +862,7 @@ void bhm_deinit(void)
 	bhm_cpuhp_unregister();
 
 	g_mgr.timer_armed = false;
-	del_timer_sync(&g_mgr.timer);
+	bhm_timer_delete_sync(&g_mgr.timer);
 
 	if (g_mgr.wq) {
 		flush_workqueue(g_mgr.wq);
@@ -841,6 +876,13 @@ void bhm_deinit(void)
 		kfree(e);
 	}
 	spin_unlock_irqrestore(&g_mgr.lock, flags);
+
+#if KERNEL_VERSION(6, 11, 0) <= LINUX_VERSION_CODE
+	if (g_mgr.dummy_dev) {
+		free_netdev(g_mgr.dummy_dev);
+		g_mgr.dummy_dev = NULL;
+	}
+#endif
 
 	g_mgr.initialized = false;
 }
@@ -942,7 +984,7 @@ static int bhm_bh_backend_init(struct bhm_bh *bh,
 		if (p->type == BHM_TYPE_THREADED_NAPI && !dev)
 			return -EINVAL;
 		if (!dev)
-			dev = &g_mgr.dummy_dev;
+			dev = g_mgr.dummy_dev;
 
 		bh->be.napi.dev        = dev;
 		bh->be.napi.user_poll  = p->u.napi.poll;
@@ -966,8 +1008,13 @@ static int bhm_bh_backend_init(struct bhm_bh *bh,
 		napi_enable(&bh->be.napi.napi);
 		bh->be.napi.added = true;
 
-		if (bh->be.napi.threaded)
+		if (bh->be.napi.threaded) {
+#if KERNEL_VERSION(6, 16, 0) <= LINUX_VERSION_CODE
+			dev_set_threaded(dev, NETDEV_NAPI_THREADED_ENABLED);
+#else
 			dev_set_threaded(dev, true);
+#endif
+		}
 		break;
 	}
 	case BHM_TYPE_TASKLET:
@@ -1119,7 +1166,7 @@ int bhm_unregister(struct bhm_bh *bh)
 	spin_unlock_irqrestore(&g_mgr.lock, flags);
 
 	if (need_timer_kill)
-		del_timer_sync(&g_mgr.timer);
+		bhm_timer_delete_sync(&g_mgr.timer);
 
 	cancel_delayed_work_sync(&bh->override_clear_work);
 	cancel_work_sync(&bh->dispatch_work);
@@ -1174,15 +1221,20 @@ int bhm_schedule(struct bhm_bh *bh)
  * Public: preferred-CPU
  * ---------------------------------------------------------------------- */
 
-/* Capacity + idle-aware CPU picker (big.LITTLE friendly).
+/* Capacity-aware CPU picker (big.LITTLE friendly).
  *
- *   1. Walk mask ∩ online. Among idle CPUs, pick the one with the highest
- *      arch_scale_cpu_capacity — i.e. prefer a big-cluster idle core over
- *      a little-cluster idle core when both are available.
- *   2. If no CPU is idle, round-robin across mask ∩ online via
- *      cpumask_any_and_distribute so repeated dispatches spread out.
+ *   1. Walk mask ∩ online, pick the CPU with the highest
+ *      arch_scale_cpu_capacity — prefers a big-cluster core.
+ *   2. Fall back to cpumask_any_and_distribute so repeated dispatches
+ *      spread out when capacities are equal.
  *
  * Returns -1 if the mask has no online member.
+ *
+ * Note: an earlier version also biased toward idle CPUs via
+ * available_idle_cpu(), but that symbol is not EXPORT_SYMBOL'd so it's
+ * unusable from loadable modules on modern kernels. The capacity-only
+ * pick is still safe; at worst it schedules onto a loaded big core
+ * instead of an idle little core.
  */
 static int bhm_pick_capacity_aware(const struct cpumask *mask)
 {
@@ -1192,11 +1244,8 @@ static int bhm_pick_capacity_aware(const struct cpumask *mask)
 	unsigned int rr;
 
 	for_each_cpu_and(cpu, mask, cpu_online_mask) {
-		unsigned long cap;
+		unsigned long cap = arch_scale_cpu_capacity(cpu);
 
-		if (!available_idle_cpu(cpu))
-			continue;
-		cap = arch_scale_cpu_capacity(cpu);
 		if (cap > best_cap) {
 			best_cap = cap;
 			best     = cpu;
