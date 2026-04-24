@@ -210,6 +210,10 @@ enum bhm_tput_dir {
  *   - Invoked on (a) transition INTO this level, (b) override edge while
  *     this level is active, (c) every 100ms tick if this level is PERIODIC
  *     and currently active.
+ *   - (a) and (b) use net-change semantics: the callback fires only when
+ *     the delivered state differs from what the consumer was last told.
+ *     A burst that nets to no change (e.g. off→on→off within one dispatch
+ *     cycle) produces no callback. Periodic ticks (c) always pass through.
  *   - avail_cpus points to an internal snapshot; copy with cpumask_copy()
  *     if the callback needs to retain it beyond the call.
  */

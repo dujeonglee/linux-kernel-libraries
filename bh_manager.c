@@ -124,6 +124,16 @@ struct bhm_bh {
 	u32                      pending_tput_rx;
 	bool                     pending_override;
 
+	/* Net-change filter for edge events. Accessed only from
+	 * bhm_dispatch_work_fn, which the workqueue serializes per work
+	 * item — no lock needed. Suppresses edge callbacks whose delivered
+	 * state matches what the consumer was last told, so bursts that net
+	 * to no change (e.g. off→on→off within one dispatch cycle) collapse
+	 * into a single net notification. Periodic ticks bypass this filter.
+	 */
+	u32                      last_reported_level;
+	bool                     last_reported_override;
+
 	/* BH backend state */
 	union {
 		struct {
@@ -252,6 +262,28 @@ static void bhm_dispatch_work_fn(struct work_struct *w)
 
 	if (!evt || level >= bh->nr_levels)
 		return;
+
+	/* Net-change filter: drop edge events whose state already matches
+	 * what the consumer was last told. Periodic ticks are not edges and
+	 * pass through unchanged. Commit the new reported state before the
+	 * callback runs so that a cb-initiated re-latch observes the value
+	 * we're about to deliver.
+	 */
+	if ((evt & BHM_EVT_LEVEL_TRANSITION) &&
+	    level == bh->last_reported_level)
+		evt &= ~BHM_EVT_LEVEL_TRANSITION;
+
+	if ((evt & BHM_EVT_OVERRIDE_EDGE) &&
+	    override_state == bh->last_reported_override)
+		evt &= ~BHM_EVT_OVERRIDE_EDGE;
+
+	if (!evt)
+		return;
+
+	if (evt & BHM_EVT_LEVEL_TRANSITION)
+		bh->last_reported_level = level;
+	if (evt & BHM_EVT_OVERRIDE_EDGE)
+		bh->last_reported_override = override_state;
 
 	cb  = bh->levels[level].cb;
 	ctx = bh->levels[level].ctx;
