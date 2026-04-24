@@ -33,6 +33,7 @@
 #include <linux/slab.h>
 #include <linux/smp.h>
 #include <linux/spinlock.h>
+#include <linux/string.h>
 #include <linux/timer.h>
 #include <linux/version.h>
 #include <linux/workqueue.h>
@@ -69,6 +70,13 @@ struct bhm_netdev {
 	u64                last_rx_bytes;
 	ktime_t            last_sample;
 	bool               primed;     /* baseline captured → deltas valid */
+
+	/* Per-tick throughput snapshot (bits/sec), refreshed by
+	 * bhm_sample_tput_locked each 100ms. Read by BHs under g_mgr.lock
+	 * to compute their filtered aggregate.
+	 */
+	u32                tx_bps;
+	u32                rx_bps;
 };
 
 struct bhm_bh {
@@ -83,6 +91,13 @@ struct bhm_bh {
 	bool                     has_periodic;   /* levels[0] is PERIODIC */
 	struct bhm_hysteresis   hyst;
 	struct bhm_override_cfg ovcfg;
+
+	/* Optional netdev name filter: NULL-terminated list of interface
+	 * names whose throughput contributes to this BH's aggregate. NULL
+	 * means "all registered netdevs" (global aggregate). Pointer and
+	 * pointees are caller-owned and must outlive the BH.
+	 */
+	const char * const      *netdev_names;
 
 	/* Preferred-CPU dispatch.
 	 *   per_cpu:        dynamic per-CPU IPI slots (alloc_percpu).
@@ -313,8 +328,7 @@ static void bhm_override_clear_work_fn(struct work_struct *w)
 	if (bh->override_on) {
 		bh->override_on = false;
 		bh->sat_streak  = 0;
-		tx    = g_mgr.last_tput_tx;
-		rx    = g_mgr.last_tput_rx;
+		bhm_bh_tput_locked(bh, &tx, &rx);
 		level = bh->current_level;
 		bhm_latch_event(bh, BHM_EVT_OVERRIDE_EDGE, level, tx, rx, false);
 		fire = true;
@@ -325,12 +339,15 @@ static void bhm_override_clear_work_fn(struct work_struct *w)
 		bhm_schedule_dispatch(bh);
 }
 
-static void bhm_trigger_override_locked(struct bhm_bh *bh, u32 tx, u32 rx)
+static void bhm_trigger_override_locked(struct bhm_bh *bh)
 {
+	u32 tx, rx;
+
 	if (bh->override_on)
 		return;
 
 	bh->override_on = true;
+	bhm_bh_tput_locked(bh, &tx, &rx);
 	bhm_latch_event(bh, BHM_EVT_OVERRIDE_EDGE, bh->current_level, tx, rx, true);
 	bhm_schedule_dispatch(bh);
 
@@ -354,8 +371,7 @@ static void bhm_account_saturated(struct bhm_bh *bh, bool saturated)
 	if (saturated) {
 		bh->sat_streak++;
 		if (bh->sat_streak >= bh->ovcfg.budget_full_streak)
-			bhm_trigger_override_locked(bh, g_mgr.last_tput_tx,
-						   g_mgr.last_tput_rx);
+			bhm_trigger_override_locked(bh);
 	} else {
 		bh->sat_streak = 0;
 	}
@@ -486,7 +502,7 @@ static void bhm_work_wrapper(struct work_struct *w)
  * 100ms sampler — aggregates per-netdev tput using rtnl_link_stats64
  * ---------------------------------------------------------------------- */
 
-static void bhm_sample_tput_locked(u32 *tx_bps, u32 *rx_bps)
+static void bhm_sample_tput_locked(u32 *global_tx_bps, u32 *global_rx_bps)
 {
 	struct bhm_netdev *e;
 	struct rtnl_link_stats64 s;
@@ -495,7 +511,7 @@ static void bhm_sample_tput_locked(u32 *tx_bps, u32 *rx_bps)
 
 	list_for_each_entry(e, &g_mgr.netdev_list, node) {
 		s64 dt_ns;
-		u64 dtx, drx;
+		u64 dtx, drx, tx_bps, rx_bps;
 
 		dev_get_stats(e->dev, &s);
 
@@ -503,6 +519,8 @@ static void bhm_sample_tput_locked(u32 *tx_bps, u32 *rx_bps)
 			e->last_tx_bytes = s.tx_bytes;
 			e->last_rx_bytes = s.rx_bytes;
 			e->last_sample   = now;
+			e->tx_bps        = 0;
+			e->rx_bps        = 0;
 			e->primed        = true;
 			continue;
 		}
@@ -513,31 +531,72 @@ static void bhm_sample_tput_locked(u32 *tx_bps, u32 *rx_bps)
 			e->last_tx_bytes = s.tx_bytes;
 			e->last_rx_bytes = s.rx_bytes;
 			e->last_sample   = now;
+			e->tx_bps        = 0;
+			e->rx_bps        = 0;
 			continue;
 		}
 
 		dtx = s.tx_bytes - e->last_tx_bytes;
 		drx = s.rx_bytes - e->last_rx_bytes;
 
-		/* bytes * 8 * 1e9 / dt_ns = bits/sec.
-		 * Use NSEC_PER_SEC scale carefully to avoid overflow.
-		 */
-		sum_tx_bps += (dtx * 8U * NSEC_PER_SEC) / (u64)dt_ns;
-		sum_rx_bps += (drx * 8U * NSEC_PER_SEC) / (u64)dt_ns;
+		/* bytes * 8 * 1e9 / dt_ns = bits/sec. */
+		tx_bps = (dtx * 8U * NSEC_PER_SEC) / (u64)dt_ns;
+		rx_bps = (drx * 8U * NSEC_PER_SEC) / (u64)dt_ns;
+
+		e->tx_bps = (tx_bps > U32_MAX) ? U32_MAX : (u32)tx_bps;
+		e->rx_bps = (rx_bps > U32_MAX) ? U32_MAX : (u32)rx_bps;
+
+		sum_tx_bps += e->tx_bps;
+		sum_rx_bps += e->rx_bps;
 
 		e->last_tx_bytes = s.tx_bytes;
 		e->last_rx_bytes = s.rx_bytes;
 		e->last_sample   = now;
 	}
 
-	*tx_bps = (sum_tx_bps > U32_MAX) ? U32_MAX : (u32)sum_tx_bps;
-	*rx_bps = (sum_rx_bps > U32_MAX) ? U32_MAX : (u32)sum_rx_bps;
+	*global_tx_bps = (sum_tx_bps > U32_MAX) ? U32_MAX : (u32)sum_tx_bps;
+	*global_rx_bps = (sum_rx_bps > U32_MAX) ? U32_MAX : (u32)sum_rx_bps;
 }
 
-static void bhm_evaluate_bh_locked(struct bhm_bh *bh, u32 tx, u32 rx)
+/* Compute @bh's filtered throughput aggregate. Caller must hold g_mgr.lock.
+ * NULL filter → global aggregate (precomputed by bhm_sample_tput_locked).
+ */
+static void bhm_bh_tput_locked(const struct bhm_bh *bh,
+				u32 *tx_bps, u32 *rx_bps)
 {
-	u32 selected = bhm_select_level(bh, tx, rx);
+	struct bhm_netdev *e;
+	u64 sum_tx = 0, sum_rx = 0;
+	const char * const *names = bh->netdev_names;
+
+	if (!names) {
+		*tx_bps = g_mgr.last_tput_tx;
+		*rx_bps = g_mgr.last_tput_rx;
+		return;
+	}
+
+	list_for_each_entry(e, &g_mgr.netdev_list, node) {
+		const char * const *n;
+
+		for (n = names; *n; n++) {
+			if (strcmp(*n, e->dev->name) == 0) {
+				sum_tx += e->tx_bps;
+				sum_rx += e->rx_bps;
+				break;
+			}
+		}
+	}
+
+	*tx_bps = (sum_tx > U32_MAX) ? U32_MAX : (u32)sum_tx;
+	*rx_bps = (sum_rx > U32_MAX) ? U32_MAX : (u32)sum_rx;
+}
+
+static void bhm_evaluate_bh_locked(struct bhm_bh *bh)
+{
+	u32 tx, rx, selected;
 	u32 evt = 0;
+
+	bhm_bh_tput_locked(bh, &tx, &rx);
+	selected = bhm_select_level(bh, tx, rx);
 
 	if (selected == bh->current_level) {
 		bh->candidate_level = bh->current_level;
@@ -587,7 +646,7 @@ static void bhm_timer_fn(unsigned long data)
 	mgr->last_tput_tx = tx;
 	mgr->last_tput_rx = rx;
 	list_for_each_entry(bh, &mgr->bh_list, node)
-		bhm_evaluate_bh_locked(bh, tx, rx);
+		bhm_evaluate_bh_locked(bh);
 	reschedule = !list_empty(&mgr->bh_list) && mgr->timer_armed;
 	spin_unlock_irqrestore(&mgr->lock, flags);
 
@@ -790,6 +849,33 @@ void bhm_deinit(void)
  * Validation
  * ---------------------------------------------------------------------- */
 
+static int bhm_validate_netdev_names(const char * const *names)
+{
+	const char * const *p;
+	u32 count = 0;
+
+	if (!names)
+		return 0;   /* NULL → all registered netdevs */
+
+	for (p = names; *p; p++) {
+		size_t len = strlen(*p);
+
+		if (len == 0 || len >= IFNAMSIZ) {
+			pr_err("invalid netdev name length (must be 1..%d)\n",
+			       IFNAMSIZ - 1);
+			return -EINVAL;
+		}
+		count++;
+	}
+
+	if (count == 0) {
+		pr_err("netdev_names is an empty array; use NULL for all\n");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 static int bhm_validate_levels(const struct bhm_params *p)
 {
 	u32 i;
@@ -970,6 +1056,10 @@ struct bhm_bh *bhm_register(const struct bhm_params *params,
 	if (ret)
 		return ERR_PTR(ret);
 
+	ret = bhm_validate_netdev_names(params->netdev_names);
+	if (ret)
+		return ERR_PTR(ret);
+
 	bh = kzalloc(sizeof(*bh), GFP_KERNEL);
 	if (!bh)
 		return ERR_PTR(-ENOMEM);
@@ -989,6 +1079,7 @@ struct bhm_bh *bhm_register(const struct bhm_params *params,
 	bh->hyst.rise_ticks = params->hyst.rise_ticks ? : BHM_DEFAULT_RISE_TICKS;
 	bh->hyst.fall_ticks = params->hyst.fall_ticks ? : BHM_DEFAULT_FALL_TICKS;
 	bh->ovcfg           = params->override;
+	bh->netdev_names    = params->netdev_names;
 	bh->current_level   = 0;
 	bh->candidate_level = 0;
 	bh->candidate_ticks = 0;
@@ -1222,7 +1313,7 @@ void bhm_force_override(struct bhm_bh *bh)
 	if (!bh)
 		return;
 	spin_lock_irqsave(&g_mgr.lock, flags);
-	bhm_trigger_override_locked(bh, g_mgr.last_tput_tx, g_mgr.last_tput_rx);
+	bhm_trigger_override_locked(bh);
 	spin_unlock_irqrestore(&g_mgr.lock, flags);
 }
 
@@ -1235,10 +1326,13 @@ void bhm_clear_override(struct bhm_bh *bh)
 		return;
 	spin_lock_irqsave(&g_mgr.lock, flags);
 	if (bh->override_on) {
+		u32 tx, rx;
+
 		bh->override_on = false;
 		bh->sat_streak  = 0;
+		bhm_bh_tput_locked(bh, &tx, &rx);
 		bhm_latch_event(bh, BHM_EVT_OVERRIDE_EDGE, bh->current_level,
-			       g_mgr.last_tput_tx, g_mgr.last_tput_rx, false);
+			       tx, rx, false);
 		fire = true;
 	}
 	spin_unlock_irqrestore(&g_mgr.lock, flags);

@@ -67,12 +67,15 @@
  *              { .threshold_bps = 500 * 1000000U, .dir = BHM_DIR_BOTH, .cb = my_cb },
  *      };
  *
+ *      static const char * const my_dev_filter[] = { "wlan0", NULL };
+ *
  *      const struct bhm_params p = {
  *              .type = BHM_TYPE_NAPI,
  *              .u.napi = { .poll = my_poll, .weight = NAPI_POLL_WEIGHT, .dev = my_dev },
  *              .levels = lv, .nr_levels = ARRAY_SIZE(lv),
  *              .hyst   = { .rise_ticks = 1, .fall_ticks = 10 },
  *              .override = { .budget_full_streak = 4, .timeout_ms = 1000 },
+ *              .netdev_names = my_dev_filter,   // optional; NULL = ALL
  *      };
  *
  *      struct bhm_bh *bh = bhm_register(&p, my_priv);
@@ -285,6 +288,21 @@ struct bhm_params {
 
 	struct bhm_hysteresis        hyst;
 	struct bhm_override_cfg      override;
+
+	/* Optional: NULL-terminated array of netdev interface names whose
+	 * aggregated throughput drives this BH's level selection and the
+	 * tput values reported to the callback.
+	 *
+	 *   NULL (default) → sum across ALL registered netdevs.
+	 *   { "wlan0", NULL }            → watch wlan0 only.
+	 *   { "wlan0", "wlan1", NULL }   → watch both interfaces.
+	 *
+	 * An empty array ({ NULL }) is rejected — use NULL to mean "all".
+	 * The pointer and the strings must outlive the BH (string literals
+	 * or static storage are the common choice). Names longer than
+	 * IFNAMSIZ-1 are rejected at registration.
+	 */
+	const char * const          *netdev_names;
 };
 
 /* ---------- Manager lifecycle ---------- */
