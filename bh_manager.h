@@ -116,15 +116,21 @@
  *              { .threshold_bps = 400 * 1000000U, .dir = BHM_DIR_TX,   .cb = tx_cb    },
  *      };
  *
+ *      struct my_ctx {
+ *              struct bhm_bh *bh;      // filled in after bhm_register
+ *              // ... other caller state ...
+ *      };
+ *      static struct my_ctx ctx;
+ *
  *      static void my_tasklet(unsigned long data)
  *      {
- *              struct bhm_bh *bh = (void *)data;
+ *              struct my_ctx *c = (struct my_ctx *)data;
  *              int processed = drain_up_to(MAX_PER_RUN);
  *
  *              if (processed == MAX_PER_RUN && still_work_pending())
- *                      bhm_report_saturated(bh);
+ *                      bhm_report_saturated(c->bh);
  *              else
- *                      bhm_report_drained(bh);
+ *                      bhm_report_drained(c->bh);
  *      }
  *
  *      const struct bhm_params p = {
@@ -134,10 +140,7 @@
  *              .override = { .budget_full_streak = 3, .timeout_ms = 500 },
  *      };
  *
- *      bh = bhm_register(&p, &ctx);
- *      // The tasklet_params.data you passed above is NOT the BH pointer;
- *      // if the handler needs the BH handle, stash it in your ctx after
- *      // register returns, or derive it via bhm_priv().
+ *      ctx.bh = bhm_register(&p, &ctx);   // back-pointer for the handler
  *
  * -------------------------------------------------------------------------
  *  Example 4: Threaded NAPI (dev->threaded = 1)
@@ -407,5 +410,60 @@ void *bhm_priv(struct bhm_bh *bh);
 
 /* Snapshot aggregated tput (bps) across all registered netdevs. */
 void bhm_get_tput(u32 *tx_bps, u32 *rx_bps);
+
+/* ---------- Backend-to-BH accessors ----------
+ *
+ * Recover the BH handle from the underlying backend object inside user
+ * handlers that receive only the backend pointer.
+ *
+ *   NAPI poll:
+ *       static int my_poll(struct napi_struct *napi, int budget) {
+ *           struct bhm_bh *bh = bhm_napi_to_bh(napi);
+ *           int done = drain(napi, budget);
+ *           if (done < budget)
+ *               bhm_report_drained(bh);
+ *           return done;
+ *       }
+ *
+ *   Workqueue:
+ *       static void my_work(struct work_struct *w) {
+ *           struct bhm_bh *bh = bhm_work_to_bh(w);
+ *           struct my_ctx *c = bhm_priv(bh);
+ *           ...
+ *       }
+ *
+ * Tasklet has no generic accessor — handlers receive the caller-supplied
+ * `unsigned long data`, not a tasklet_struct. Stash the BH pointer in
+ * your ctx struct after bhm_register() returns and pass the ctx as data:
+ *
+ *       struct my_ctx {
+ *           struct bhm_bh *bh;        // filled in after register
+ *           // ... other state ...
+ *       };
+ *
+ *       static void my_tasklet(unsigned long data) {
+ *           struct my_ctx *c = (struct my_ctx *)data;
+ *           int processed = drain_up_to(MAX_PER_RUN);
+ *
+ *           if (processed == MAX_PER_RUN && still_work_pending())
+ *                   bhm_report_saturated(c->bh);
+ *           else
+ *                   bhm_report_drained(c->bh);
+ *       }
+ *
+ *       static struct my_ctx ctx;
+ *       const struct bhm_params p = {
+ *           .type = BHM_TYPE_TASKLET,
+ *           .u.tasklet = { .fn = my_tasklet, .data = (unsigned long)&ctx },
+ *           // ...
+ *       };
+ *       ctx.bh = bhm_register(&p, &ctx);   // back-pointer for the handler
+ *
+ * These accept only backend pointers that actually belong to a BH
+ * registered with the matching type. Passing an unrelated pointer is
+ * undefined behavior (container_of returns garbage).
+ */
+struct bhm_bh *bhm_napi_to_bh(struct napi_struct *napi);
+struct bhm_bh *bhm_work_to_bh(struct work_struct *work);
 
 #endif /* __BH_MANAGER_H__ */

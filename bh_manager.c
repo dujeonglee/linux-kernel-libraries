@@ -1382,3 +1382,13 @@ void bhm_get_tput(u32 *tx_bps, u32 *rx_bps)
 	if (rx_bps) *rx_bps = g_mgr.last_tput_rx;
 	spin_unlock_irqrestore(&g_mgr.lock, flags);
 }
+
+struct bhm_bh *bhm_napi_to_bh(struct napi_struct *napi)
+{
+	return container_of(napi, struct bhm_bh, be.napi.napi);
+}
+
+struct bhm_bh *bhm_work_to_bh(struct work_struct *work)
+{
+	return container_of(work, struct bhm_bh, be.work.w);
+}
