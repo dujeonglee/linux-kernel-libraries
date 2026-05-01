@@ -893,8 +893,13 @@ static void bhm_arm_timer_if_needed_locked(void)
 		return;
 
 	g_mgr.timer_armed = true;
-	mod_timer(&g_mgr.timer,
-		  jiffies + msecs_to_jiffies(BHM_TIMER_PERIOD_MS));
+	/* First tick fires on the next jiffy so the sampler primes
+	 * netdev byte counters promptly; subsequent ticks reschedule
+	 * themselves at BHM_TIMER_PERIOD_MS in bhm_timer_fn. Without
+	 * this the first BH ever registered would wait a full 100 ms
+	 * before any sampling started.
+	 */
+	mod_timer(&g_mgr.timer, jiffies + 1);
 }
 
 /* -------------------------------------------------------------------------
@@ -1389,6 +1394,14 @@ struct bhm_bh *bhm_register(const struct bhm_params *params,
 	list_add_tail(&bh->node, &g_mgr.bh_list);
 	bhm_resolve_filter_locked(bh);
 	bhm_arm_timer_if_needed_locked();
+	/* Run one evaluation synchronously so periodic BHs receive their
+	 * first PERIODIC_TICK without waiting for the timer, and BHs
+	 * registered into already-flowing traffic enter the hysteresis
+	 * candidate state immediately instead of one tick late. tput is
+	 * read from the last sampler snapshot (zero on the very first BH
+	 * register, but accurate for any subsequent register).
+	 */
+	bhm_evaluate_bh_locked(bh);
 	spin_unlock_irqrestore(&g_mgr.lock, flags);
 
 	return bh;
