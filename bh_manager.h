@@ -411,35 +411,53 @@ void *bhm_priv(struct bhm_bh *bh);
 /* Snapshot aggregated tput (bps) across all registered netdevs. */
 void bhm_get_tput(u32 *tx_bps, u32 *rx_bps);
 
-/* ---------- Migration counters (NAPI redirect path) ----------
+/* ---------- Migration counters (NAPI + TASKLET redirect paths) ----------
  *
- * The NAPI poll wrapper redirects polling to bh->preferred_mask via
- * smp_call_function_single_async() (an IPI carrying napi_schedule on the
- * target CPU). Several outcomes are possible per attempt:
+ * Both NAPI (non-threaded) and TASKLET migrate via
+ * smp_call_function_single_async() — an IPI carrying napi_schedule() or
+ * tasklet_schedule() on the target CPU. The counters live on every BH
+ * but are only updated by these two backends; THREADED_NAPI and
+ * WORKQUEUE leave them at zero (THREADED_NAPI relies on kthread
+ * affinity, WORKQUEUE on queue_work_on()).
  *
- *   attempts        : poll wrapper entered the migration branch
- *                     (bhm_should_use_ipi() returned true).
+ * Per attempt outcomes:
  *
- *   complete_missed : napi_complete_done() returned false because MISSED
- *                     was already set on entry; the NAPI is now
- *                     re-scheduled locally and the IPI was deliberately
- *                     suppressed (firing it would have set MISSED on the
- *                     target with no effect).
+ *   attempts        : the dispatch site decided to migrate
+ *                     (bhm_should_use_ipi() returned true). For NAPI
+ *                     this is per poll-wrapper invocation; for TASKLET
+ *                     this is per bhm_schedule() call.
  *
- *   dispatched      : ipi_send to the target CPU succeeded; the target
- *                     should pick up polling on its softirq.
+ *   complete_missed : NAPI ONLY. napi_complete_done() returned false
+ *                     because MISSED was already set on entry; the NAPI
+ *                     is now re-scheduled locally and the IPI was
+ *                     deliberately suppressed (firing it would have set
+ *                     MISSED on the target with no effect). Always 0
+ *                     for TASKLET — there is no MISSED equivalent.
+ *
+ *   dispatched      : ipi_send to the target CPU succeeded. For NAPI
+ *                     the target's softirq picks up polling; for
+ *                     TASKLET the target's tasklet_schedule queues the
+ *                     tasklet (idempotent, so a no-op if already
+ *                     pending — see "defeat" note below).
  *
  *   dispatch_failed : ipi_send failed (e.g. target CPU raced offline);
  *                     the wrapper re-kicked locally as a fallback.
  *
  * In an ideal run, attempts == complete_missed + dispatched +
- * dispatch_failed. If "attempts" outpaces the sum, an in-window IRQ
- * defeated the migration: a fresh IRQ on the source CPU between
- * napi_complete_done() and ipi_send() set SCHED locally, and the
- * subsequent IPI's napi_schedule() on the target only set MISSED.
- * The local poll then runs again and migration is retried. This race
- * is fundamental to building migration on top of NAPI primitives without
- * touching the driver's IRQ path; see the comment in bhm_napi_poll_wrapper.
+ * dispatch_failed. If attempts outpaces the sum, migration was defeated
+ * by a primitive-level race that is not directly observable:
+ *
+ *   - NAPI: a fresh IRQ between napi_complete_done() and ipi_send()
+ *     re-schedules locally; the subsequent IPI's napi_schedule() on
+ *     the target only sets MISSED.
+ *
+ *   - TASKLET: the tasklet was already pending locally when the IPI
+ *     fired, so the target's tasklet_schedule() was a no-op and the
+ *     tasklet ran on the local CPU.
+ *
+ * Both races are fundamental on top of the underlying primitives
+ * without touching the driver's IRQ path; see the long comment block
+ * in bhm_napi_poll_wrapper for the NAPI case.
  *
  * Counters are atomic snapshots — read concurrently with the BH running
  * is fine. They are zeroed at bhm_register() and never reset thereafter.

@@ -221,9 +221,12 @@ struct bhm_bh {
 		} work;
 	} be;
 
-	/* Migration outcome counters (NAPI redirect path). See
-	 * bhm_napi_poll_wrapper for definitions of each event. atomic64 so
-	 * concurrent readers (bhm_get_migration_counters) need no lock.
+	/* Migration outcome counters. Updated by NAPI (poll wrapper) and
+	 * TASKLET (bhm_schedule) dispatch paths; THREADED_NAPI and
+	 * WORKQUEUE leave them at zero. mig_complete_missed is NAPI-only
+	 * — see bh_manager.h "Migration counters" for definitions.
+	 * atomic64 so concurrent readers (bhm_get_migration_counters)
+	 * need no lock.
 	 */
 	atomic64_t               mig_attempts;
 	atomic64_t               mig_complete_missed;
@@ -1454,9 +1457,28 @@ int bhm_schedule(struct bhm_bh *bh)
 	case BHM_TYPE_TASKLET: {
 		int preferred;
 
-		if (bhm_should_use_ipi(bh, &preferred) &&
-		    bhm_ipi_send(bh, preferred) == 0)
-			return 0;              /* handed off via IPI */
+		/* TASKLET migration is simpler than NAPI: tasklet_schedule
+		 * is idempotent on TASKLET_STATE_SCHED, there is no MISSED
+		 * bit and no napi_complete_done equivalent. We therefore
+		 * track only attempts / dispatched / dispatch_failed; the
+		 * complete_missed counter is NAPI-specific and remains 0.
+		 *
+		 * A subtle "defeat" can still happen: if the tasklet was
+		 * already pending on the local CPU when we issued the IPI,
+		 * the target's tasklet_schedule is a no-op and the tasklet
+		 * runs locally. That race is not directly counted; like
+		 * the NAPI in-window IRQ case it shows up as attempts
+		 * outpacing observable cross-CPU runs.
+		 */
+		if (bhm_should_use_ipi(bh, &preferred)) {
+			atomic64_inc(&bh->mig_attempts);
+			if (bhm_ipi_send(bh, preferred) == 0) {
+				atomic64_inc(&bh->mig_dispatched);
+				return 0;          /* handed off via IPI */
+			}
+			atomic64_inc(&bh->mig_dispatch_failed);
+			/* Fall through to local schedule. */
+		}
 		tasklet_schedule(&bh->be.tasklet.t);
 		return 0;
 	}
