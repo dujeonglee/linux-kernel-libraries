@@ -322,12 +322,29 @@ void bhm_deinit(void);
  * Safe to call before or after bhm_init (registration persists).
  * Duplicate registration returns -EEXIST. Unregistering an unknown dev
  * returns -ENOENT.
+ *
+ * Safety net: bhm_init() also installs a NETDEV_UNREGISTER notifier so
+ * that an entry is dropped automatically if a tracked netdev gets
+ * unregistered without bhm_unregister_netdev() being called first.
+ * This prevents the next sample tick from dereferencing a freed dev.
+ * Callers should still pair register/unregister explicitly — relying
+ * on the safety net is a contract violation that can race with the
+ * sampler.
  */
 int  bhm_register_netdev(struct net_device *dev);
 int  bhm_unregister_netdev(struct net_device *dev);
 
-/* ---------- BH lifecycle ---------- */
-
+/* ---------- BH lifecycle ----------
+ *
+ * For NAPI / THREADED_NAPI BHs, params->u.napi.dev (when non-NULL) is
+ * stored inside the BH and used as the NAPI anchor (netif_napi_add).
+ * That dev must outlive the BH — call bhm_unregister(bh) BEFORE
+ * unregister_netdev(dev). The NETDEV_UNREGISTER notifier installed by
+ * bhm_init() WARNs loudly if it sees a dev going away while a BH is
+ * still anchored on it, but does not auto-detach the NAPI; the kernel's
+ * own free_netdev() will walk dev->napi_list at that point and the
+ * BH's later bhm_unregister() then cleans up the manager-side state.
+ */
 struct bhm_bh *bhm_register(const struct bhm_params *params,
 				 void *priv);
 int  bhm_unregister(struct bhm_bh *bh);

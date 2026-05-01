@@ -249,6 +249,9 @@ struct bhm_mgr {
 	enum cpuhp_state  cpuhp_state;
 	bool              cpuhp_registered;
 
+	struct notifier_block netdev_nb;
+	bool              netdev_nb_registered;
+
 	/* NAPI anchor when caller supplies no netdev. Allocated via
 	 * alloc_netdev_dummy() on v6.11+, otherwise initialized in-place
 	 * from the fallback storage below.
@@ -989,29 +992,103 @@ int bhm_register_netdev(struct net_device *dev)
 	return 0;
 }
 
+/* Detach the bhm_netdev tracking @dev from the list and unlink it from
+ * every BH's resolved cache. Returns the detached entry (caller frees) or
+ * NULL if @dev was not tracked. Caller must hold g_mgr.lock.
+ */
+static struct bhm_netdev *bhm_drop_netdev_locked(struct net_device *dev)
+{
+	struct bhm_netdev *e, *tmp;
+
+	lockdep_assert_held(&g_mgr.lock);
+
+	list_for_each_entry_safe(e, tmp, &g_mgr.netdev_list, node) {
+		if (e->dev == dev) {
+			bhm_resolve_unlink_netdev_locked(e);
+			list_del(&e->node);
+			return e;
+		}
+	}
+	return NULL;
+}
+
 int bhm_unregister_netdev(struct net_device *dev)
 {
-	struct bhm_netdev *e, *tmp, *found = NULL;
+	struct bhm_netdev *found;
 	unsigned long flags;
 
 	if (!dev)
 		return -EINVAL;
 
 	spin_lock_irqsave(&g_mgr.lock, flags);
-	list_for_each_entry_safe(e, tmp, &g_mgr.netdev_list, node) {
-		if (e->dev == dev) {
-			bhm_resolve_unlink_netdev_locked(e);
-			list_del(&e->node);
-			found = e;
-			break;
-		}
-	}
+	found = bhm_drop_netdev_locked(dev);
 	spin_unlock_irqrestore(&g_mgr.lock, flags);
 
 	if (!found)
 		return -ENOENT;
 	kfree(found);
 	return 0;
+}
+
+/* NETDEV_UNREGISTER safety net.
+ *
+ * Two cleanups, in order:
+ *
+ *   A. If @dev is tracked in g_mgr.netdev_list (via bhm_register_netdev),
+ *      drop it. This protects against callers that forget to invoke
+ *      bhm_unregister_netdev() before unregister_netdevice() — the next
+ *      sample tick would otherwise dev_get_stats() on freed memory.
+ *
+ *   B. If any registered BH still anchors a NAPI on @dev (via
+ *      bh->be.napi.dev), warn loudly. We do not detach NAPI ourselves
+ *      here: doing so safely would require synchronizing with a possibly
+ *      concurrent bhm_unregister(bh), and the kernel's own free_netdev()
+ *      walks dev->napi_list and calls netif_napi_del() on every entry,
+ *      which is idempotent w.r.t. our later cleanup. The contract
+ *      remains "call bhm_unregister(bh) before unregister_netdev(dev)";
+ *      the WARN converts the silent "what the heck happened later"
+ *      class of bug into a loud, traceable one.
+ */
+static int bhm_netdev_event(struct notifier_block *nb, unsigned long event,
+			    void *ptr)
+{
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+	struct bhm_netdev *dropped = NULL;
+	struct bhm_bh *bh;
+	bool napi_anchor_match = false;
+	unsigned long flags;
+
+	if (event != NETDEV_UNREGISTER)
+		return NOTIFY_DONE;
+	if (!g_mgr.initialized)
+		return NOTIFY_DONE;
+
+	spin_lock_irqsave(&g_mgr.lock, flags);
+
+	/* (A) tput-aggregation entry, if any. */
+	dropped = bhm_drop_netdev_locked(dev);
+
+	/* (B) NAPI anchor abuse detection. */
+	list_for_each_entry(bh, &g_mgr.bh_list, node) {
+		if ((bh->type == BHM_TYPE_NAPI ||
+		     bh->type == BHM_TYPE_THREADED_NAPI) &&
+		    bh->be.napi.added &&
+		    bh->be.napi.dev == dev) {
+			napi_anchor_match = true;
+			break;
+		}
+	}
+
+	spin_unlock_irqrestore(&g_mgr.lock, flags);
+
+	kfree(dropped);
+
+	if (napi_anchor_match)
+		WARN(1,
+		     "bh_manager: net_device '%s' unregistered while still anchoring a registered NAPI BH; caller must call bhm_unregister(bh) before unregister_netdev(dev)\n",
+		     dev->name);
+
+	return NOTIFY_DONE;
 }
 
 /* -------------------------------------------------------------------------
@@ -1066,6 +1143,24 @@ int bhm_init(void)
 		return ret;
 	}
 
+	/* The notifier is registered last so the rest of the manager is
+	 * fully initialized by the time NETDEV_UNREGISTER callbacks could
+	 * fire. Symmetrically, deinit unregisters it first.
+	 */
+	g_mgr.netdev_nb.notifier_call = bhm_netdev_event;
+	ret = register_netdevice_notifier(&g_mgr.netdev_nb);
+	if (ret < 0) {
+		bhm_cpuhp_unregister();
+#if BHM_HAS_ALLOC_NETDEV_DUMMY
+		free_netdev(g_mgr.dummy_dev);
+		g_mgr.dummy_dev = NULL;
+#endif
+		destroy_workqueue(g_mgr.wq);
+		g_mgr.wq = NULL;
+		return ret;
+	}
+	g_mgr.netdev_nb_registered = true;
+
 	g_mgr.initialized = true;
 	return 0;
 }
@@ -1077,6 +1172,11 @@ void bhm_deinit(void)
 
 	if (!g_mgr.initialized)
 		return;
+
+	if (g_mgr.netdev_nb_registered) {
+		unregister_netdevice_notifier(&g_mgr.netdev_nb);
+		g_mgr.netdev_nb_registered = false;
+	}
 
 	bhm_cpuhp_unregister();
 
