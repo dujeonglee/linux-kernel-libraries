@@ -84,6 +84,16 @@
  * Internal state
  * ---------------------------------------------------------------------- */
 
+/**
+ * enum bhm_evt_kind - Bitmask for events latched on a BH between dispatches.
+ * @BHM_EVT_NONE: No pending event.
+ * @BHM_EVT_LEVEL_TRANSITION: Level changed; deliver the new level.
+ * @BHM_EVT_PERIODIC_TICK: Active level is PERIODIC; deliver a tick.
+ * @BHM_EVT_OVERRIDE_EDGE: Override flag flipped; deliver the new state.
+ *
+ * Multiple bits can be set on the same dispatch cycle; the dispatcher
+ * resolves each in turn (with net-change suppression for edges).
+ */
 enum bhm_evt_kind {
 	BHM_EVT_NONE             = 0,
 	BHM_EVT_LEVEL_TRANSITION = (1 << 0),
@@ -91,83 +101,139 @@ enum bhm_evt_kind {
 	BHM_EVT_OVERRIDE_EDGE    = (1 << 2),
 };
 
-/* Per-CPU IPI slot used by NAPI and TASKLET preferred-CPU dispatch. */
+/**
+ * struct bhm_per_cpu - Per-CPU IPI slot for preferred-CPU dispatch.
+ * @csd: call_single_data used by smp_call_function_single_async().
+ * @queued: 1-bit "IPI in flight" flag manipulated via test_and_set_bit()
+ *          / clear_bit() on bit 0. Set by the dispatcher, cleared by
+ *          bhm_csd_fn() as its last operation.
+ * @bh: Back-pointer to the owning BH (so bhm_csd_fn() can recover it).
+ *
+ * One slot per possible CPU is allocated via alloc_percpu() for
+ * %BHM_TYPE_NAPI and %BHM_TYPE_TASKLET BHs. THREADED_NAPI and WORKQUEUE
+ * do not use IPI redirection and skip the allocation.
+ */
 struct bhm_per_cpu {
 	call_single_data_t  csd;
-	unsigned long       queued;   /* 1-bit; test_and_set_bit(0, &queued) */
+	unsigned long       queued;
 	struct bhm_bh     *bh;
 };
 
+/**
+ * struct bhm_netdev - Tracked netdev state for tput aggregation.
+ * @node: Linkage into &bhm_mgr.netdev_list.
+ * @dev: The tracked net_device. Caller-owned; lifetime managed by
+ *       bhm_register_netdev() / bhm_unregister_netdev() (and the
+ *       NETDEV_UNREGISTER notifier as a safety net).
+ * @last_tx_bytes: Snapshot of dev's TX byte counter at @last_sample.
+ * @last_rx_bytes: Snapshot of dev's RX byte counter at @last_sample.
+ * @last_sample: Time of the previous sampler tick.
+ * @primed: True once a baseline has been captured. The first sample
+ *          only seeds @last_*; subsequent samples produce real deltas.
+ * @tx_bps: Most recent TX bits/second (refreshed every 100 ms by the
+ *          sampler). Read by BHs under g_mgr.lock to compute their
+ *          filtered aggregate.
+ * @rx_bps: Most recent RX bits/second (same as @tx_bps).
+ */
 struct bhm_netdev {
-	struct list_head   node;       /* g_mgr.netdev_list */
+	struct list_head   node;
 	struct net_device *dev;
 	u64                last_tx_bytes;
 	u64                last_rx_bytes;
 	ktime_t            last_sample;
-	bool               primed;     /* baseline captured → deltas valid */
-
-	/* Per-tick throughput snapshot (bits/sec), refreshed by
-	 * bhm_sample_tput_locked each 100ms. Read by BHs under g_mgr.lock
-	 * to compute their filtered aggregate.
-	 */
+	bool               primed;
 	u32                tx_bps;
 	u32                rx_bps;
 };
 
+/**
+ * struct bhm_bh - Internal state for one registered BH.
+ * @node: Linkage into &bhm_mgr.bh_list.
+ * @priv: Caller's opaque pointer from bhm_register(); returned by
+ *        bhm_priv().
+ * @type: Backend kind (NAPI / THREADED_NAPI / TASKLET / WORKQUEUE).
+ * @levels: Internal copy of the caller's levels[] array.
+ * @nr_levels: Number of entries in @levels.
+ * @has_periodic: True if @levels[0] is PERIODIC.
+ * @hyst: Tick counts for level-transition hysteresis.
+ * @ovcfg: Override / saturation configuration.
+ * @netdev_names: Caller-supplied filter (NULL = global aggregate).
+ * @resolved_devs: Parallel array sized @filter_count; each slot caches
+ *                 the &bhm_netdev whose dev->name matches
+ *                 @netdev_names[i], or NULL if unresolved. Maintained
+ *                 under g_mgr.lock by bhm_resolve_*() helpers so the
+ *                 100 ms hot path is O(@filter_count).
+ *                 NULL when @netdev_names is NULL.
+ *                 NOTE: cache is keyed by name at the moment of
+ *                 (un)register; runtime renames (NETDEV_CHANGENAME) are
+ *                 not tracked.
+ * @filter_count: Number of names in @netdev_names (0 if NULL).
+ * @per_cpu: Dynamic per-CPU IPI slots (alloc_percpu). Allocated only
+ *           for %BHM_TYPE_NAPI and %BHM_TYPE_TASKLET.
+ * @preferred_mask: User-supplied allowed CPU set. Empty = no preference.
+ *                  Writes serialised under g_mgr.lock; hot-path reads
+ *                  unlocked (torn reads are benign — mispicks self-
+ *                  correct on the next dispatch).
+ * @current_level: Currently active level index (state machine).
+ * @candidate_level: Level being considered for transition; see
+ *                   bhm_evaluate_bh_locked().
+ * @candidate_ticks: Consecutive ticks @candidate_level has been seen.
+ * @override_on: True while override is latched.
+ * @sat_streak: Consecutive saturated runs counted toward
+ *              @ovcfg.budget_full_streak.
+ * @override_clear_work: Delayed work that clears @override_on after
+ *                       @ovcfg.timeout_ms.
+ * @dispatch_work: Work item that runs the user callback in a sleepable
+ *                 context.
+ * @pending_evt: Bitmask of &enum bhm_evt_kind to deliver on next dispatch.
+ * @pending_level: Level to report on next dispatch.
+ * @pending_tput_tx: TX bps to report on next dispatch.
+ * @pending_tput_rx: RX bps to report on next dispatch.
+ * @pending_override: Override state to report on next dispatch.
+ * @last_reported_level: Net-change filter — last level delivered to user.
+ *                       Accessed only from bhm_dispatch_work_fn (which
+ *                       the workqueue serialises per work item; no lock
+ *                       needed).
+ * @last_reported_override: Net-change filter — last override delivered.
+ * @be: Backend-specific state, selected by @type.
+ * @be.napi: NAPI / THREADED_NAPI state.
+ * @be.napi.napi: Embedded napi_struct used by netif_napi_add().
+ * @be.napi.dev: NAPI anchor netdev (real or g_mgr.dummy_dev).
+ * @be.napi.user_poll: Caller's poll function, wrapped by
+ *                     bhm_napi_poll_wrapper.
+ * @be.napi.weight: NAPI weight.
+ * @be.napi.threaded: True if this is THREADED_NAPI.
+ * @be.napi.added: True between netif_napi_add() and netif_napi_del().
+ * @be.tasklet: TASKLET state.
+ * @be.tasklet.t: Embedded tasklet_struct.
+ * @be.tasklet.user_fn: Caller's tasklet handler.
+ * @be.tasklet.data: Caller-supplied opaque value passed to @user_fn.
+ * @be.work: WORKQUEUE state.
+ * @be.work.w: Embedded work_struct.
+ * @be.work.wq: Workqueue (NULL = system_wq).
+ * @be.work.user_fn: Caller's work handler.
+ * @mig_attempts: Migration counter; see &struct bhm_migration_counters.
+ * @mig_complete_missed: Migration counter (NAPI only).
+ * @mig_dispatched: Migration counter.
+ * @mig_dispatch_failed: Migration counter.
+ */
 struct bhm_bh {
-	struct list_head         node;     /* g_mgr.bh_list */
+	struct list_head         node;
 	void                    *priv;
 
 	enum bhm_type        type;
 
-	/* Config copies (registration-time, immutable) */
 	struct bhm_level    *levels;
 	u32                      nr_levels;
-	bool                     has_periodic;   /* levels[0] is PERIODIC */
+	bool                     has_periodic;
 	struct bhm_hysteresis   hyst;
 	struct bhm_override_cfg ovcfg;
 
-	/* Optional netdev name filter: NULL-terminated list of interface
-	 * names whose throughput contributes to this BH's aggregate. NULL
-	 * means "all registered netdevs" (global aggregate). Pointer and
-	 * pointees are caller-owned and must outlive the BH.
-	 */
 	const char * const      *netdev_names;
 
-	/* Resolved cache for `netdev_names`. Parallel array sized
-	 * `filter_count`; each slot holds the bhm_netdev whose dev->name
-	 * matches netdev_names[i], or NULL if no such netdev is currently
-	 * registered. Maintained under g_mgr.lock at BH register time and
-	 * on every bhm_register_netdev / bhm_unregister_netdev so the
-	 * 100ms hot path can sum filtered throughput in O(filter_count)
-	 * instead of O(filter_count × |netdev_list|). NULL when
-	 * netdev_names is NULL (global aggregate).
-	 *
-	 * Note: cache is keyed by name at the moment of (un)register;
-	 * runtime renames (NETDEV_CHANGENAME) are not tracked.
-	 */
 	struct bhm_netdev      **resolved_devs;
 	unsigned int             filter_count;
 
-	/* Preferred-CPU dispatch.
-	 *   per_cpu:        dynamic per-CPU IPI slots (alloc_percpu).
-	 *                   Allocated only for NAPI and TASKLET — the types
-	 *                   that use IPI-based cross-CPU dispatch. NULL for
-	 *                   THREADED_NAPI / WORKQUEUE.
-	 *   preferred_mask: user-supplied allowed set. Empty = no preference.
-	 *                   Writes under g_mgr.lock; hot-path reads unlocked
-	 *                   (torn reads are benign — mask is a placement hint,
-	 *                   mispicks self-correct on the next dispatch).
-	 *
-	 * Placement policy (see bhm_resolve_preferred_cpu):
-	 *   1. If the current CPU is inside preferred_mask, stay — honors
-	 *      whatever delivered the IRQ/event here (IRQ affinity, softirq
-	 *      locality). Also warms cache.
-	 *   2. Else pick the HIGHEST-CAPACITY idle CPU within the mask
-	 *      (big.LITTLE aware via arch_scale_cpu_capacity).
-	 *   3. Else (nobody idle) fair-distribute via
-	 *      cpumask_any_and_distribute.
-	 */
 	struct bhm_per_cpu __percpu *per_cpu;
 	cpumask_t                        preferred_mask;
 
@@ -178,32 +244,22 @@ struct bhm_bh {
 	bool                     override_on;
 	u32                      sat_streak;
 
-	/* Override auto-clear */
 	struct delayed_work      override_clear_work;
 
-	/* Dispatch (sleepable callback execution) */
 	struct work_struct       dispatch_work;
-	u32                      pending_evt;        /* bitmask of BHM_EVT_* */
+	u32                      pending_evt;
 	u32                      pending_level;
 	u32                      pending_tput_tx;
 	u32                      pending_tput_rx;
 	bool                     pending_override;
 
-	/* Net-change filter for edge events. Accessed only from
-	 * bhm_dispatch_work_fn, which the workqueue serializes per work
-	 * item — no lock needed. Suppresses edge callbacks whose delivered
-	 * state matches what the consumer was last told, so bursts that net
-	 * to no change (e.g. off→on→off within one dispatch cycle) collapse
-	 * into a single net notification. Periodic ticks bypass this filter.
-	 */
 	u32                      last_reported_level;
 	bool                     last_reported_override;
 
-	/* BH backend state */
 	union {
 		struct {
 			struct napi_struct   napi;
-			struct net_device   *dev;      /* may be g_mgr.dummy_dev */
+			struct net_device   *dev;
 			int                (*user_poll)(struct napi_struct *, int);
 			int                  weight;
 			bool                 threaded;
@@ -221,23 +277,45 @@ struct bhm_bh {
 		} work;
 	} be;
 
-	/* Migration outcome counters. Updated by NAPI (poll wrapper) and
-	 * TASKLET (bhm_schedule) dispatch paths; THREADED_NAPI and
-	 * WORKQUEUE leave them at zero. mig_complete_missed is NAPI-only
-	 * — see bh_manager.h "Migration counters" for definitions.
-	 * atomic64 so concurrent readers (bhm_get_migration_counters)
-	 * need no lock.
-	 */
 	atomic64_t               mig_attempts;
 	atomic64_t               mig_complete_missed;
 	atomic64_t               mig_dispatched;
 	atomic64_t               mig_dispatch_failed;
 };
 
+/**
+ * struct bhm_mgr - Singleton manager state.
+ * @lock: Guards @bh_list, every BH's mutable state, and @netdev_list.
+ *        spinlock_irqsave is required because the timer fn runs in
+ *        softirq context.
+ * @bh_list: All registered BHs.
+ * @netdev_list: All netdevs tracked for tput aggregation.
+ * @timer: 100 ms sampling timer.
+ * @timer_armed: True while @timer is scheduled to fire.
+ * @wq: Workqueue for sleepable callback dispatch and override-clear
+ *      delayed work.
+ * @cpu_avail: Mask of currently-online CPUs (maintained by cpuhp
+ *             callbacks). Snapshotted into the avail_cpus argument of
+ *             user level callbacks.
+ * @cpu_lock: Guards @cpu_avail.
+ * @cpuhp_state: cpuhp state ID returned by cpuhp_setup_state().
+ * @cpuhp_registered: True between bhm_cpuhp_register() and
+ *                    bhm_cpuhp_unregister().
+ * @netdev_nb: notifier_block for the NETDEV_UNREGISTER safety net.
+ * @netdev_nb_registered: True while @netdev_nb is registered with the
+ *                        netdev notifier chain.
+ * @dummy_dev: NAPI anchor for callers that don't supply one.
+ * @dummy_dev_storage: Fallback in-place storage when alloc_netdev_dummy()
+ *                     is not available (pre-v6.11). Field exists only
+ *                     on those builds.
+ * @last_tput_tx: Most recent global TX aggregate (bps).
+ * @last_tput_rx: Most recent global RX aggregate (bps).
+ * @initialized: True between bhm_init() success and bhm_deinit().
+ */
 struct bhm_mgr {
-	spinlock_t        lock;            /* guards bh_list + bh state + netdev_list */
+	spinlock_t        lock;
 	struct list_head  bh_list;
-	struct list_head  netdev_list;     /* bhm_netdev entries */
+	struct list_head  netdev_list;
 
 	struct timer_list timer;
 	bool              timer_armed;
@@ -252,10 +330,6 @@ struct bhm_mgr {
 	struct notifier_block netdev_nb;
 	bool              netdev_nb_registered;
 
-	/* NAPI anchor when caller supplies no netdev. Allocated via
-	 * alloc_netdev_dummy() on v6.11+, otherwise initialized in-place
-	 * from the fallback storage below.
-	 */
 	struct net_device *dummy_dev;
 #if !BHM_HAS_ALLOC_NETDEV_DUMMY
 	struct net_device dummy_dev_storage;
@@ -267,6 +341,7 @@ struct bhm_mgr {
 	bool              initialized;
 };
 
+/* The singleton manager instance. Module is single-instance by design. */
 static struct bhm_mgr g_mgr;
 
 /* -------------------------------------------------------------------------
@@ -278,11 +353,25 @@ static void bhm_bh_tput_locked(const struct bhm_bh *bh,
 				u32 *tx_bps, u32 *rx_bps);
 static int bhm_resolve_preferred_cpu(struct bhm_bh *bh);
 
+/**
+ * bhm_level_is_periodic() - Test whether @lv is the PERIODIC floor.
+ * @lv: Level to test.
+ *
+ * Return: True iff @lv->threshold_bps == %BHM_LEVEL_PERIODIC.
+ */
 static inline bool bhm_level_is_periodic(const struct bhm_level *lv)
 {
 	return lv->threshold_bps == BHM_LEVEL_PERIODIC;
 }
 
+/**
+ * bhm_tput_for_dir() - Project (tx, rx) onto the requested direction.
+ * @tx: TX bits/second.
+ * @rx: RX bits/second.
+ * @d: Direction selector.
+ *
+ * Return: @tx for %BHM_DIR_TX, @rx for %BHM_DIR_RX, @tx + @rx otherwise.
+ */
 static inline u32 bhm_tput_for_dir(u32 tx, u32 rx, enum bhm_tput_dir d)
 {
 	switch (d) {
@@ -293,8 +382,18 @@ static inline u32 bhm_tput_for_dir(u32 tx, u32 rx, enum bhm_tput_dir d)
 	}
 }
 
-/* Select active level for (tx, rx). Walk high→low; first satisfying level
- * wins. If none satisfies, return index 0 (PERIODIC floor or threshold==0).
+/**
+ * bhm_select_level() - Choose the active level for the given throughput.
+ * @bh: BH whose levels are scanned.
+ * @tx: Current TX bits/second.
+ * @rx: Current RX bits/second.
+ *
+ * Walks the levels from highest index downward (skipping the PERIODIC
+ * floor); the first level whose direction-projected tput meets its
+ * threshold wins. Falls back to index 0 (PERIODIC floor or
+ * threshold == 0) if none match.
+ *
+ * Return: Level index in [0, @bh->nr_levels).
  */
 static u32 bhm_select_level(const struct bhm_bh *bh, u32 tx, u32 rx)
 {
@@ -313,12 +412,30 @@ static u32 bhm_select_level(const struct bhm_bh *bh, u32 tx, u32 rx)
 	return 0;
 }
 
+/**
+ * bhm_schedule_dispatch() - Queue the BH's dispatch work item.
+ * @bh: BH whose @dispatch_work should run.
+ *
+ * No-op if g_mgr.wq is not yet initialised. Idempotent (workqueue
+ * collapses repeated submissions).
+ */
 static void bhm_schedule_dispatch(struct bhm_bh *bh)
 {
 	if (g_mgr.wq)
 		queue_work(g_mgr.wq, &bh->dispatch_work);
 }
 
+/**
+ * bhm_latch_event() - Record an event for the next dispatch.
+ * @bh: Target BH.
+ * @evt_bit: Bitmask of &enum bhm_evt_kind to OR into pending_evt.
+ * @level: Level to report alongside the event.
+ * @tx: TX bps snapshot to report.
+ * @rx: RX bps snapshot to report.
+ * @override_state: Override flag to report.
+ *
+ * Context: Caller must hold g_mgr.lock.
+ */
 static void bhm_latch_event(struct bhm_bh *bh, u32 evt_bit, u32 level,
 			   u32 tx, u32 rx, bool override_state)
 {
@@ -334,6 +451,15 @@ static void bhm_latch_event(struct bhm_bh *bh, u32 evt_bit, u32 level,
  * Dispatcher — runs in workqueue, invokes the user callback
  * ---------------------------------------------------------------------- */
 
+/**
+ * bhm_dispatch_work_fn() - Workqueue handler that delivers latched events.
+ * @w: Embedded &bhm_bh.dispatch_work.
+ *
+ * Reads pending state under g_mgr.lock, applies the net-change filter
+ * to suppress edge events whose state matches what was last reported,
+ * commits the new reported state, then invokes the user callback in
+ * sleepable context with a snapshot of the current cpu_avail mask.
+ */
 static void bhm_dispatch_work_fn(struct work_struct *w)
 {
 	struct bhm_bh *bh = container_of(w, struct bhm_bh, dispatch_work);
@@ -394,9 +520,15 @@ static void bhm_dispatch_work_fn(struct work_struct *w)
  * Override auto-clear work
  * ---------------------------------------------------------------------- */
 
-/* Returns true iff override was on and got cleared (caller should
- * bhm_schedule_dispatch outside the lock to deliver the edge). Caller must
- * hold g_mgr.lock.
+/**
+ * bhm_clear_override_locked() - Drop @bh's override and latch an edge event.
+ * @bh: BH to clear.
+ *
+ * Context: Caller must hold g_mgr.lock; should call
+ * bhm_schedule_dispatch() outside the lock when this returns true.
+ *
+ * Return: True iff override was on and got cleared. False if it was
+ * already off (in which case no event is latched).
  */
 static bool bhm_clear_override_locked(struct bhm_bh *bh)
 {
@@ -415,6 +547,13 @@ static bool bhm_clear_override_locked(struct bhm_bh *bh)
 	return true;
 }
 
+/**
+ * bhm_override_clear_work_fn() - Delayed-work handler for override timeout.
+ * @w: Embedded &bhm_bh.override_clear_work (delayed_work).
+ *
+ * Scheduled by bhm_trigger_override_locked() when ovcfg.timeout_ms is
+ * non-zero. Clears override and dispatches the edge event.
+ */
 static void bhm_override_clear_work_fn(struct work_struct *w)
 {
 	struct delayed_work *dw = to_delayed_work(w);
@@ -430,6 +569,15 @@ static void bhm_override_clear_work_fn(struct work_struct *w)
 		bhm_schedule_dispatch(bh);
 }
 
+/**
+ * bhm_trigger_override_locked() - Latch override on @bh and dispatch.
+ * @bh: BH to override.
+ *
+ * No-op if @bh is already in override. If ovcfg.timeout_ms is non-zero,
+ * schedules the auto-clear delayed work.
+ *
+ * Context: Caller must hold g_mgr.lock.
+ */
 static void bhm_trigger_override_locked(struct bhm_bh *bh)
 {
 	u32 tx, rx;
@@ -453,6 +601,16 @@ static void bhm_trigger_override_locked(struct bhm_bh *bh)
  * Saturation streak accounting (called from BH wrapper)
  * ---------------------------------------------------------------------- */
 
+/**
+ * bhm_account_saturated() - Update the saturation streak and trigger override.
+ * @bh: BH being accounted.
+ * @saturated: True if the latest run hit its budget / saturation; false
+ *             if it drained.
+ *
+ * No-op when ovcfg.budget_full_streak is 0 (auto override disabled).
+ * Otherwise, @saturated increments the streak and may latch override
+ * once the configured threshold is reached; !@saturated resets it.
+ */
 static void bhm_account_saturated(struct bhm_bh *bh, bool saturated)
 {
 	unsigned long flags;
@@ -482,6 +640,19 @@ static void bhm_account_saturated(struct bhm_bh *bh, bool saturated)
  * UAF on bh pointer.
  * ---------------------------------------------------------------------- */
 
+/**
+ * bhm_csd_fn() - CSD callback: re-schedule the BH on the target CPU.
+ * @info: Pointer to the &bhm_per_cpu slot whose CSD fired.
+ *
+ * Runs on the target CPU after smp_call_function_single_async().
+ * Issues napi_schedule() or tasklet_schedule() on that CPU so the
+ * softirq picks the BH up there, then clears the per-slot @queued bit
+ * as its very last operation. The clear is what teardown's busy-wait
+ * (see bhm_drain_pending_csds()) waits on to know the slot is no
+ * longer in flight.
+ *
+ * Context: IPI / softirq.
+ */
 static void bhm_csd_fn(void *info)
 {
 	struct bhm_per_cpu *pc = info;
@@ -504,8 +675,17 @@ static void bhm_csd_fn(void *info)
 	clear_bit(0, &pc->queued);
 }
 
-/* Decides whether we should redirect the BH to a different CPU.
- * On true, writes the target CPU to *preferred.
+/**
+ * bhm_should_use_ipi() - Decide whether to redirect this dispatch.
+ * @bh: BH whose preferred mask is consulted.
+ * @preferred: Out: target CPU when the function returns true.
+ *
+ * Returns false (and leaves @preferred unwritten) when:
+ *   - The BH has no per-CPU IPI slots (only NAPI / TASKLET allocate them).
+ *   - The resolved preferred CPU is the current CPU.
+ *   - No preference is configured.
+ *
+ * Return: True iff an IPI to @preferred should be sent.
  */
 static bool bhm_should_use_ipi(struct bhm_bh *bh, int *preferred)
 {
@@ -522,8 +702,17 @@ static bool bhm_should_use_ipi(struct bhm_bh *bh, int *preferred)
 	return true;
 }
 
-/* Queues an IPI to @preferred CPU. Returns 0 on success (including when the
- * slot already had a pending IPI), negative on dispatch failure.
+/**
+ * bhm_ipi_send() - Queue an async CSD to @preferred.
+ * @bh: BH that owns the per-CPU slots.
+ * @preferred: Target CPU.
+ *
+ * Uses test_and_set_bit() on the slot's @queued bit to suppress
+ * redundant IPIs while one is already in flight to that CPU.
+ *
+ * Return: 0 on success (including the "already pending" case);
+ * negative errno from smp_call_function_single_async() on dispatch
+ * failure (e.g. target CPU offline).
  */
 static int bhm_ipi_send(struct bhm_bh *bh, int preferred)
 {
@@ -545,6 +734,19 @@ static int bhm_ipi_send(struct bhm_bh *bh, int preferred)
  * NAPI / tasklet / workqueue wrappers
  * ---------------------------------------------------------------------- */
 
+/**
+ * bhm_napi_poll_wrapper() - NAPI poll wrapper applying migration policy.
+ * @napi: Embedded napi_struct, recovered to the owning BH via container_of.
+ * @budget: NAPI budget for this poll.
+ *
+ * If a different CPU is preferred, hands the NAPI off to that CPU via
+ * IPI instead of polling here. Otherwise calls the user poll function
+ * and accounts saturation. See the in-function comment for the three
+ * race orderings (napi_complete_done timing, MISSED bail, in-window
+ * IRQ defeat) and the corresponding migration counters.
+ *
+ * Return: NAPI work-done value (0 on migration handoff).
+ */
 static int bhm_napi_poll_wrapper(struct napi_struct *napi, int budget)
 {
 	struct bhm_bh *bh = container_of(napi, struct bhm_bh, be.napi.napi);
@@ -602,26 +804,50 @@ static int bhm_napi_poll_wrapper(struct napi_struct *napi, int budget)
 	return work_done;
 }
 
+/**
+ * bhm_tasklet_wrapper() - Tasklet trampoline that calls the user fn.
+ * @data: BH pointer (cast).
+ *
+ * Saturation/drain are reported explicitly via bhm_report_saturated() /
+ * bhm_report_drained() from inside the user handler.
+ */
 static void bhm_tasklet_wrapper(unsigned long data)
 {
 	struct bhm_bh *bh = (struct bhm_bh *)data;
 
 	bh->be.tasklet.user_fn(bh->be.tasklet.data);
-	/* Drain/saturate reported explicitly via bhm_report_*. */
 }
 
+/**
+ * bhm_work_wrapper() - Work-item trampoline that calls the user fn.
+ * @w: Embedded work_struct, recovered to the BH via container_of.
+ *
+ * Saturation/drain are reported explicitly via bhm_report_saturated() /
+ * bhm_report_drained() from inside the user handler.
+ */
 static void bhm_work_wrapper(struct work_struct *w)
 {
 	struct bhm_bh *bh = container_of(w, struct bhm_bh, be.work.w);
 
 	bh->be.work.user_fn(w);
-	/* Drain/saturate reported explicitly via bhm_report_*. */
 }
 
 /* -------------------------------------------------------------------------
  * 100ms sampler — aggregates per-netdev tput using rtnl_link_stats64
  * ---------------------------------------------------------------------- */
 
+/**
+ * bhm_sample_tput_locked() - Refresh per-netdev rates and global aggregate.
+ * @global_tx_bps: Out: aggregate TX bits/second across all tracked netdevs.
+ * @global_rx_bps: Out: aggregate RX bits/second across all tracked netdevs.
+ *
+ * Walks netdev_list, calls dev_get_stats() on each, computes a per-netdev
+ * delta-based bps and stores it in the entry; sums the rates into the
+ * global out-params. The first observation per netdev only seeds the
+ * baseline (rate set to 0).
+ *
+ * Context: Caller must hold g_mgr.lock.
+ */
 static void bhm_sample_tput_locked(u32 *global_tx_bps, u32 *global_rx_bps)
 {
 	struct bhm_netdev *e;
@@ -680,10 +906,18 @@ static void bhm_sample_tput_locked(u32 *global_tx_bps, u32 *global_rx_bps)
 	*global_rx_bps = (sum_rx_bps > U32_MAX) ? U32_MAX : (u32)sum_rx_bps;
 }
 
-/* Compute @bh's filtered throughput aggregate. Caller must hold g_mgr.lock.
- * NULL filter → global aggregate (precomputed by bhm_sample_tput_locked).
- * Otherwise sums over the resolved-netdev cache, which is kept in sync by
- * bhm_register_netdev / bhm_unregister_netdev / bhm_register.
+/**
+ * bhm_bh_tput_locked() - Compute @bh's filtered throughput aggregate.
+ * @bh: BH whose filter is summed.
+ * @tx_bps: Out: aggregate TX bps for the BH's filter.
+ * @rx_bps: Out: aggregate RX bps for the BH's filter.
+ *
+ * NULL filter (no @netdev_names) returns the precomputed global
+ * aggregate. Otherwise sums over the resolved-netdev cache, kept in
+ * sync by bhm_register_netdev() / bhm_unregister_netdev() /
+ * bhm_register().
+ *
+ * Context: Caller must hold g_mgr.lock.
  */
 static void bhm_bh_tput_locked(const struct bhm_bh *bh,
 				u32 *tx_bps, u32 *rx_bps)
@@ -712,8 +946,13 @@ static void bhm_bh_tput_locked(const struct bhm_bh *bh,
 	*rx_bps = (sum_rx > U32_MAX) ? U32_MAX : (u32)sum_rx;
 }
 
-/* Find the bhm_netdev for `name` in g_mgr.netdev_list, or NULL.
- * Caller must hold g_mgr.lock.
+/**
+ * bhm_find_netdev_by_name_locked() - Look up a tracked netdev by name.
+ * @name: Interface name to match against e->dev->name.
+ *
+ * Context: Caller must hold g_mgr.lock.
+ *
+ * Return: The matching &bhm_netdev or NULL if not tracked.
  */
 static struct bhm_netdev *bhm_find_netdev_by_name_locked(const char *name)
 {
@@ -728,13 +967,17 @@ static struct bhm_netdev *bhm_find_netdev_by_name_locked(const char *name)
 	return NULL;
 }
 
-/* Populate bh->resolved_devs from the current g_mgr.netdev_list.
- * Caller must hold g_mgr.lock.
+/**
+ * bhm_resolve_filter_locked() - Populate @bh->resolved_devs from netdev_list.
+ * @bh: BH whose filter is being resolved.
  *
- * If the caller's filter names the same netdev twice, only the first slot
- * holds the pointer; later duplicates stay NULL. This matches the previous
- * strcmp-based aggregation, which iterated each netdev once and broke on
- * the first matching name (so a netdev was counted at most once per BH).
+ * If the caller's filter names the same netdev twice, only the first
+ * slot holds the pointer; later duplicates stay NULL. This matches the
+ * pre-cache strcmp-based aggregation, which iterated each netdev once
+ * and broke on the first matching name (so a netdev was counted at
+ * most once per BH).
+ *
+ * Context: Caller must hold g_mgr.lock.
  */
 static void bhm_resolve_filter_locked(struct bhm_bh *bh)
 {
@@ -761,9 +1004,15 @@ static void bhm_resolve_filter_locked(struct bhm_bh *bh)
 	}
 }
 
-/* For each registered BH, fill in the first NULL resolved-cache slot whose
- * name matches @e->dev->name (skipping BHs that already have @e linked).
- * Caller must hold g_mgr.lock.
+/**
+ * bhm_resolve_link_netdev_locked() - Hook a freshly-registered netdev into BH caches.
+ * @e: Newly-tracked &bhm_netdev.
+ *
+ * For each registered BH that has not already linked @e, walks its
+ * names and populates the first NULL slot whose name matches
+ * @e->dev->name (one slot per BH; duplicates remain NULL).
+ *
+ * Context: Caller must hold g_mgr.lock.
  */
 static void bhm_resolve_link_netdev_locked(struct bhm_netdev *e)
 {
@@ -799,8 +1048,13 @@ static void bhm_resolve_link_netdev_locked(struct bhm_netdev *e)
 	}
 }
 
-/* For each registered BH, NULL out any resolved-cache slot pointing to @e.
- * Caller must hold g_mgr.lock.
+/**
+ * bhm_resolve_unlink_netdev_locked() - Drop @e from every BH's resolved cache.
+ * @e: &bhm_netdev being detached.
+ *
+ * For each registered BH, NULL-out any cache slot pointing to @e.
+ *
+ * Context: Caller must hold g_mgr.lock.
  */
 static void bhm_resolve_unlink_netdev_locked(struct bhm_netdev *e)
 {
@@ -820,6 +1074,17 @@ static void bhm_resolve_unlink_netdev_locked(struct bhm_netdev *e)
 	}
 }
 
+/**
+ * bhm_evaluate_bh_locked() - Run one tick of the level state machine for @bh.
+ * @bh: BH to evaluate.
+ *
+ * Computes filtered tput, picks the candidate level, applies hysteresis
+ * (rise_ticks / fall_ticks), and latches BHM_EVT_LEVEL_TRANSITION /
+ * BHM_EVT_PERIODIC_TICK as appropriate. Schedules dispatch if any
+ * event was latched.
+ *
+ * Context: Caller must hold g_mgr.lock.
+ */
 static void bhm_evaluate_bh_locked(struct bhm_bh *bh)
 {
 	u32 tx, rx, selected;
@@ -857,6 +1122,15 @@ static void bhm_evaluate_bh_locked(struct bhm_bh *bh)
 	}
 }
 
+/**
+ * bhm_timer_fn() - 100 ms periodic sampler timer.
+ * @t: Embedded &bhm_mgr.timer (or @data on legacy kernels).
+ *
+ * Samples all tracked netdevs, evaluates every registered BH, and
+ * reschedules itself if there is still work to do.
+ *
+ * Context: Soft IRQ.
+ */
 #if BHM_HAS_TIMER_SETUP
 static void bhm_timer_fn(struct timer_list *t)
 #else
@@ -889,6 +1163,16 @@ static void bhm_timer_fn(unsigned long data)
 			  jiffies + msecs_to_jiffies(BHM_TIMER_PERIOD_MS));
 }
 
+/**
+ * bhm_arm_timer_if_needed_locked() - Start the sampler if there is work.
+ *
+ * No-op if the timer is already armed or if there are no BHs registered.
+ * The first tick fires on the next jiffy so the sampler primes netdev
+ * byte counters promptly; subsequent ticks reschedule themselves at
+ * %BHM_TIMER_PERIOD_MS in bhm_timer_fn().
+ *
+ * Context: Caller must hold g_mgr.lock.
+ */
 static void bhm_arm_timer_if_needed_locked(void)
 {
 	lockdep_assert_held(&g_mgr.lock);
@@ -899,12 +1183,6 @@ static void bhm_arm_timer_if_needed_locked(void)
 		return;
 
 	g_mgr.timer_armed = true;
-	/* First tick fires on the next jiffy so the sampler primes
-	 * netdev byte counters promptly; subsequent ticks reschedule
-	 * themselves at BHM_TIMER_PERIOD_MS in bhm_timer_fn. Without
-	 * this the first BH ever registered would wait a full 100 ms
-	 * before any sampling started.
-	 */
 	mod_timer(&g_mgr.timer, jiffies + 1);
 }
 
@@ -912,6 +1190,15 @@ static void bhm_arm_timer_if_needed_locked(void)
  * CPU hotplug integration (self-contained via cpuhp_setup_state)
  * ---------------------------------------------------------------------- */
 
+/**
+ * bhm_cpuhp_online() - cpuhp callback when @cpu comes online.
+ * @cpu: CPU number.
+ *
+ * Sets the bit in g_mgr.cpu_avail. Also fires once per online CPU at
+ * cpuhp_setup_state() time.
+ *
+ * Return: Always 0.
+ */
 static int bhm_cpuhp_online(unsigned int cpu)
 {
 	unsigned long flags;
@@ -922,6 +1209,14 @@ static int bhm_cpuhp_online(unsigned int cpu)
 	return 0;
 }
 
+/**
+ * bhm_cpuhp_offline() - cpuhp callback when @cpu goes offline.
+ * @cpu: CPU number.
+ *
+ * Clears the bit in g_mgr.cpu_avail.
+ *
+ * Return: Always 0.
+ */
 static int bhm_cpuhp_offline(unsigned int cpu)
 {
 	unsigned long flags;
@@ -932,14 +1227,19 @@ static int bhm_cpuhp_offline(unsigned int cpu)
 	return 0;
 }
 
+/**
+ * bhm_cpuhp_register() - Install cpu_avail tracking via cpuhp callbacks.
+ *
+ * The startup callback fires for every already-online CPU at setup
+ * time, so the mask is populated atomically with registration — no
+ * need to seed g_mgr.cpu_avail separately.
+ *
+ * Return: 0 on success or negative errno from cpuhp_setup_state().
+ */
 static int bhm_cpuhp_register(void)
 {
 	int ret;
 
-	/* The startup callback fires for every already-online CPU at setup
-	 * time, so the mask is populated atomically with registration — no
-	 * need to seed g_mgr.cpu_avail separately.
-	 */
 	ret = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "net/bhm:online",
 				bhm_cpuhp_online, bhm_cpuhp_offline);
 	if (ret < 0)
@@ -950,6 +1250,9 @@ static int bhm_cpuhp_register(void)
 	return 0;
 }
 
+/**
+ * bhm_cpuhp_unregister() - Remove cpu_avail tracking. Idempotent.
+ */
 static void bhm_cpuhp_unregister(void)
 {
 	if (!g_mgr.cpuhp_registered)
@@ -963,6 +1266,19 @@ static void bhm_cpuhp_unregister(void)
  * Netdev registry
  * ---------------------------------------------------------------------- */
 
+/**
+ * bhm_register_netdev() - Track @dev for tput aggregation.
+ * @dev: Net device to track.
+ *
+ * Adds @dev to netdev_list, links it into every interested BH's
+ * resolved cache, and arms the sampling timer if needed. See the
+ * header for the lifetime contract and the safety net behaviour.
+ *
+ * Context: Sleepable (allocates GFP_KERNEL).
+ *
+ * Return: 0 on success; -EINVAL if @dev is NULL; -EEXIST if already
+ * tracked; -ENOMEM on alloc failure.
+ */
 int bhm_register_netdev(struct net_device *dev)
 {
 	struct bhm_netdev *e, *new_entry;
@@ -992,9 +1308,16 @@ int bhm_register_netdev(struct net_device *dev)
 	return 0;
 }
 
-/* Detach the bhm_netdev tracking @dev from the list and unlink it from
- * every BH's resolved cache. Returns the detached entry (caller frees) or
- * NULL if @dev was not tracked. Caller must hold g_mgr.lock.
+/**
+ * bhm_drop_netdev_locked() - Detach the entry tracking @dev.
+ * @dev: Net device to drop.
+ *
+ * Unlinks the matching &bhm_netdev from netdev_list AND from every
+ * BH's resolved-dev cache. Caller frees the returned entry.
+ *
+ * Context: Caller must hold g_mgr.lock.
+ *
+ * Return: The detached &bhm_netdev, or NULL if @dev was not tracked.
  */
 static struct bhm_netdev *bhm_drop_netdev_locked(struct net_device *dev)
 {
@@ -1012,6 +1335,15 @@ static struct bhm_netdev *bhm_drop_netdev_locked(struct net_device *dev)
 	return NULL;
 }
 
+/**
+ * bhm_unregister_netdev() - Stop tracking @dev for tput aggregation.
+ * @dev: Net device previously passed to bhm_register_netdev().
+ *
+ * Context: Sleepable.
+ *
+ * Return: 0 on success; -EINVAL if @dev is NULL; -ENOENT if @dev was
+ * not tracked.
+ */
 int bhm_unregister_netdev(struct net_device *dev)
 {
 	struct bhm_netdev *found;
@@ -1030,24 +1362,31 @@ int bhm_unregister_netdev(struct net_device *dev)
 	return 0;
 }
 
-/* NETDEV_UNREGISTER safety net.
+/**
+ * bhm_netdev_event() - NETDEV_UNREGISTER notifier callback (safety net).
+ * @nb: Pointer to g_mgr.netdev_nb.
+ * @event: Notifier event code; only %NETDEV_UNREGISTER is handled.
+ * @ptr: Notifier info, used to recover the &net_device.
  *
  * Two cleanups, in order:
  *
- *   A. If @dev is tracked in g_mgr.netdev_list (via bhm_register_netdev),
- *      drop it. This protects against callers that forget to invoke
- *      bhm_unregister_netdev() before unregister_netdevice() — the next
- *      sample tick would otherwise dev_get_stats() on freed memory.
+ *   A. If @dev is tracked in g_mgr.netdev_list (via
+ *      bhm_register_netdev()), drop it. Protects against callers that
+ *      forget to invoke bhm_unregister_netdev() before
+ *      unregister_netdevice() — the next sample tick would otherwise
+ *      dev_get_stats() on freed memory.
  *
  *   B. If any registered BH still anchors a NAPI on @dev (via
  *      bh->be.napi.dev), warn loudly. We do not detach NAPI ourselves
- *      here: doing so safely would require synchronizing with a possibly
- *      concurrent bhm_unregister(bh), and the kernel's own free_netdev()
- *      walks dev->napi_list and calls netif_napi_del() on every entry,
- *      which is idempotent w.r.t. our later cleanup. The contract
- *      remains "call bhm_unregister(bh) before unregister_netdev(dev)";
- *      the WARN converts the silent "what the heck happened later"
- *      class of bug into a loud, traceable one.
+ *      here: doing so safely would require synchronizing with a
+ *      possibly concurrent bhm_unregister(bh), and the kernel's own
+ *      free_netdev() walks dev->napi_list and calls netif_napi_del()
+ *      on every entry, which is idempotent w.r.t. our later cleanup.
+ *      The contract remains "call bhm_unregister(bh) before
+ *      unregister_netdev(dev)"; the WARN converts the silent class of
+ *      bug into a loud, traceable one.
+ *
+ * Return: %NOTIFY_DONE.
  */
 static int bhm_netdev_event(struct notifier_block *nb, unsigned long event,
 			    void *ptr)
@@ -1095,6 +1434,20 @@ static int bhm_netdev_event(struct notifier_block *nb, unsigned long event,
  * Manager init / deinit
  * ---------------------------------------------------------------------- */
 
+/**
+ * bhm_init() - Initialize the global bh_manager state.
+ *
+ * Allocates the manager workqueue, sets up the sampling timer, creates
+ * the dummy NAPI anchor netdev, registers cpuhp callbacks, and installs
+ * the NETDEV_UNREGISTER notifier. Must be called once before any other
+ * bhm_*() function.
+ *
+ * Context: Sleepable.
+ *
+ * Return: 0 on success; -EBUSY if already initialized; -ENOMEM or other
+ * negative errno on resource failure (everything allocated so far is
+ * rolled back).
+ */
 int bhm_init(void)
 {
 	int ret;
@@ -1165,6 +1518,17 @@ int bhm_init(void)
 	return 0;
 }
 
+/**
+ * bhm_deinit() - Tear down the global bh_manager state.
+ *
+ * Reverses bhm_init() in opposite order: notifier first (so no further
+ * callbacks fire), then cpuhp, timer, workqueue, netdev_list, and
+ * dummy NAPI anchor. Caller is responsible for unregistering all BHs
+ * and tracked netdevs first; any leftover netdev_list entries are
+ * still freed defensively.
+ *
+ * Context: Sleepable. No-op if bhm_init() was never run.
+ */
 void bhm_deinit(void)
 {
 	struct bhm_netdev *e, *tmp;
@@ -1210,6 +1574,16 @@ void bhm_deinit(void)
  * Validation
  * ---------------------------------------------------------------------- */
 
+/**
+ * bhm_validate_netdev_names() - Sanity-check a caller's filter array.
+ * @names: Caller-supplied NULL-terminated string array, or NULL.
+ *
+ * NULL means "all registered netdevs" and is accepted. A non-NULL array
+ * must contain at least one name and each name must fit in IFNAMSIZ-1.
+ *
+ * Return: 0 on success; -EINVAL otherwise (with a pr_err describing
+ * the issue).
+ */
 static int bhm_validate_netdev_names(const char * const *names)
 {
 	const char * const *p;
@@ -1237,6 +1611,15 @@ static int bhm_validate_netdev_names(const char * const *names)
 	return 0;
 }
 
+/**
+ * bhm_validate_levels() - Sanity-check a caller's levels[] array.
+ * @p: Registration parameters.
+ *
+ * Verifies every level has a non-NULL @cb, the PERIODIC level (if any)
+ * is at index 0, and the remaining thresholds are strictly ascending.
+ *
+ * Return: 0 on success; -EINVAL otherwise.
+ */
 static int bhm_validate_levels(const struct bhm_params *p)
 {
 	u32 i;
@@ -1269,6 +1652,15 @@ static int bhm_validate_levels(const struct bhm_params *p)
  * BH register / unregister
  * ---------------------------------------------------------------------- */
 
+/**
+ * bhm_alloc_per_cpu_slots() - Allocate per-CPU IPI slots for @bh.
+ * @bh: BH to populate.
+ *
+ * Allocates one &bhm_per_cpu per possible CPU and seeds each slot's
+ * back-pointer and CSD function/info. Used by NAPI and TASKLET BHs.
+ *
+ * Return: 0 on success; -ENOMEM on alloc failure.
+ */
 static int bhm_alloc_per_cpu_slots(struct bhm_bh *bh)
 {
 	int cpu;
@@ -1288,6 +1680,20 @@ static int bhm_alloc_per_cpu_slots(struct bhm_bh *bh)
 	return 0;
 }
 
+/**
+ * bhm_bh_backend_init() - Initialise the backend-specific state on @bh.
+ * @bh: BH being constructed.
+ * @p: Registration parameters.
+ *
+ * For NAPI/THREADED_NAPI this calls netif_napi_add(), enables NAPI,
+ * and (for threaded) flips dev_set_threaded(). For TASKLET it sets up
+ * tasklet_struct and per-CPU IPI slots. For WORKQUEUE it just
+ * initialises work_struct.
+ *
+ * Context: Sleepable. May allocate.
+ *
+ * Return: 0 on success; negative errno on bad params or alloc failure.
+ */
 static int bhm_bh_backend_init(struct bhm_bh *bh,
 			      const struct bhm_params *p)
 {
@@ -1362,6 +1768,21 @@ static int bhm_bh_backend_init(struct bhm_bh *bh,
 	return 0;
 }
 
+/**
+ * bhm_drain_pending_csds() - Wait for in-flight CSDs to clear before free.
+ * @bh: BH being torn down.
+ *
+ * A CSD in flight will set `queued=1` until bhm_csd_fn() clears it as
+ * its last operation. This function busy-waits each per-CPU slot until
+ * the bit clears so we don't free @bh while a CSD still dereferences it.
+ *
+ * Bound the wait: if a slot stays stuck (e.g. the target CPU raced
+ * offline after smp_call_function_single_async() returned 0 but before
+ * the CSD fired), an unbounded spin would deadlock teardown. On
+ * timeout we WARN and proceed; this matches the prior behavior w.r.t.
+ * UAF risk (no worse than the original unbounded spin which also
+ * could not recover) but no longer hangs the caller.
+ */
 static void bhm_drain_pending_csds(struct bhm_bh *bh)
 {
 	int cpu;
@@ -1370,17 +1791,6 @@ static void bhm_drain_pending_csds(struct bhm_bh *bh)
 	if (!bh->per_cpu)
 		return;
 
-	/* A CSD in flight will set `queued=1` until bhm_csd_fn clears it as
-	 * its last operation. Busy-wait briefly until every slot drains so
-	 * we don't free the bh while a CSD still dereferences it.
-	 *
-	 * Bound the wait: if a slot stays stuck (e.g. the target CPU raced
-	 * offline after smp_call_function_single_async() returned 0 but
-	 * before the CSD fired), an unbounded spin would deadlock teardown.
-	 * On timeout we WARN and proceed; this matches the prior behavior
-	 * w.r.t. UAF risk (no worse than the original unbounded spin which
-	 * also could not recover) but no longer hangs the caller.
-	 */
 	deadline = jiffies + msecs_to_jiffies(BHM_CSD_DRAIN_TIMEOUT_MS);
 	for_each_possible_cpu(cpu) {
 		struct bhm_per_cpu *pc = per_cpu_ptr(bh->per_cpu, cpu);
@@ -1397,6 +1807,16 @@ static void bhm_drain_pending_csds(struct bhm_bh *bh)
 	}
 }
 
+/**
+ * bhm_bh_backend_deinit() - Reverse bhm_bh_backend_init() for @bh.
+ * @bh: BH being torn down.
+ *
+ * For NAPI/THREADED_NAPI: napi_disable() + netif_napi_del(). For
+ * TASKLET: tasklet_kill(). For WORKQUEUE: cancel_work_sync(). Then
+ * drains any in-flight CSDs and frees per-CPU slots.
+ *
+ * Context: Sleepable.
+ */
 static void bhm_bh_backend_deinit(struct bhm_bh *bh)
 {
 	switch (bh->type) {
@@ -1423,6 +1843,21 @@ static void bhm_bh_backend_deinit(struct bhm_bh *bh)
 	}
 }
 
+/**
+ * bhm_register() - Register a new BH and start tracking it.
+ * @params: Registration parameters; copied as needed before return.
+ * @priv: Opaque pointer retrievable later via bhm_priv().
+ *
+ * Validates @params, allocates the BH, builds the resolved-netdev
+ * cache, brings up the backend, links the BH into the manager, and
+ * runs one synchronous evaluation so periodic BHs receive their first
+ * PERIODIC_TICK without waiting for the timer.
+ *
+ * Context: Sleepable.
+ *
+ * Return: A new &bhm_bh on success; an %ERR_PTR encoding -EINVAL,
+ * -ENOMEM, or another negative errno on failure.
+ */
 struct bhm_bh *bhm_register(const struct bhm_params *params,
 				 void *priv)
 {
@@ -1510,6 +1945,17 @@ struct bhm_bh *bhm_register(const struct bhm_params *params,
 	return bh;
 }
 
+/**
+ * bhm_unregister() - Tear down a BH.
+ * @bh: BH returned by bhm_register().
+ *
+ * Cancels pending work, disables the backend, drains in-flight CSDs,
+ * and frees @bh's allocations.
+ *
+ * Context: Sleepable.
+ *
+ * Return: 0 on success; -EINVAL if @bh is NULL.
+ */
 int bhm_unregister(struct bhm_bh *bh)
 {
 	unsigned long flags;
@@ -1539,6 +1985,19 @@ int bhm_unregister(struct bhm_bh *bh)
 	return 0;
 }
 
+/**
+ * bhm_schedule() - Request the BH to run once.
+ * @bh: BH returned by bhm_register().
+ *
+ * For NAPI/THREADED_NAPI calls napi_schedule(); preferred-CPU policy
+ * runs in the poll wrapper. For TASKLET attempts IPI-redirect to the
+ * preferred CPU, falling back to local tasklet_schedule(). For
+ * WORKQUEUE uses queue_work_on() when a preferred CPU is set.
+ *
+ * Context: Any.
+ *
+ * Return: 0 on success; -EINVAL on bad @bh or unknown type.
+ */
 int bhm_schedule(struct bhm_bh *bh)
 {
 	if (!bh)
@@ -1601,20 +2060,22 @@ int bhm_schedule(struct bhm_bh *bh)
  * Public: preferred-CPU
  * ---------------------------------------------------------------------- */
 
-/* Capacity-aware CPU picker (big.LITTLE friendly).
+/**
+ * bhm_pick_capacity_aware() - Choose a CPU within @mask favoring big cores.
+ * @mask: Allowed CPU set.
  *
- *   1. Walk mask ∩ online, pick the CPU with the highest
- *      arch_scale_cpu_capacity — prefers a big-cluster core.
- *   2. Fall back to cpumask_any_and_distribute so repeated dispatches
- *      spread out when capacities are equal.
- *
- * Returns -1 if the mask has no online member.
+ * Walks @mask intersected with cpu_online_mask and picks the CPU with
+ * the highest arch_scale_cpu_capacity() — biased toward a big-cluster
+ * core. Falls back to cpumask_any_and_distribute() so repeated
+ * dispatches spread out when capacities are equal.
  *
  * Note: an earlier version also biased toward idle CPUs via
  * available_idle_cpu(), but that symbol is not EXPORT_SYMBOL'd so it's
  * unusable from loadable modules on modern kernels. The capacity-only
  * pick is still safe; at worst it schedules onto a loaded big core
  * instead of an idle little core.
+ *
+ * Return: A CPU id, or -1 if @mask has no online member.
  */
 static int bhm_pick_capacity_aware(const struct cpumask *mask)
 {
@@ -1638,11 +2099,17 @@ static int bhm_pick_capacity_aware(const struct cpumask *mask)
 	return (rr < nr_cpu_ids) ? (int)rr : -1;
 }
 
-/* Resolve where this BH should run right now:
- *   - no preference        → -1
- *   - single-bit mask      → that bit (if online; no analysis needed)
- *   - current CPU allowed  → current CPU (short-circuit; no IPI needed)
- *   - else                 → capacity-aware pick from mask ∩ online
+/**
+ * bhm_resolve_preferred_cpu() - Pick where @bh should run right now.
+ * @bh: BH whose preferred mask is consulted.
+ *
+ * Resolution order:
+ *  - no preference (empty mask)        → -1
+ *  - single-bit mask                   → that bit (if online)
+ *  - current CPU is in mask and online → current CPU (no IPI needed)
+ *  - else                              → bhm_pick_capacity_aware(mask)
+ *
+ * Return: CPU id, or -1 if no online CPU is allowed.
  */
 static int bhm_resolve_preferred_cpu(struct bhm_bh *bh)
 {
@@ -1665,6 +2132,20 @@ static int bhm_resolve_preferred_cpu(struct bhm_bh *bh)
 	return bhm_pick_capacity_aware(&bh->preferred_mask);
 }
 
+/**
+ * bhm_set_preferred_cpumask() - Bind @bh's execution to a CPU set.
+ * @bh: BH to configure.
+ * @mask: Allowed CPU set, or NULL/empty to clear preference.
+ *
+ * For THREADED_NAPI BHs, set_cpus_allowed_ptr() is applied to the
+ * NAPI kthread. For NAPI / TASKLET / WORKQUEUE the mask is consulted
+ * at every dispatch via bhm_resolve_preferred_cpu().
+ *
+ * Context: Any (safe from level callbacks). May sleep when applying
+ * kthread affinity for THREADED_NAPI.
+ *
+ * Return: 0 on success; -EINVAL if @bh is NULL.
+ */
 int bhm_set_preferred_cpumask(struct bhm_bh *bh, const struct cpumask *mask)
 {
 	unsigned long flags;
@@ -1702,6 +2183,17 @@ int bhm_set_preferred_cpumask(struct bhm_bh *bh, const struct cpumask *mask)
 	return 0;
 }
 
+/**
+ * bhm_set_preferred_cpu() - Single-CPU convenience wrapper.
+ * @bh: BH to configure.
+ * @cpu: CPU id to pin to, or -1 to clear preference.
+ *
+ * Equivalent to bhm_set_preferred_cpumask() with a single-bit mask.
+ *
+ * Context: Any.
+ *
+ * Return: 0 on success; -EINVAL on bad @bh or out-of-range @cpu.
+ */
 int bhm_set_preferred_cpu(struct bhm_bh *bh, int cpu)
 {
 	cpumask_t mask;
@@ -1723,18 +2215,46 @@ int bhm_set_preferred_cpu(struct bhm_bh *bh, int cpu)
  * Public: saturation / override / queries
  * ---------------------------------------------------------------------- */
 
+/**
+ * bhm_report_saturated() - Notify the manager the BH ran to saturation.
+ * @bh: BH to update.
+ *
+ * Equivalent to one full-budget NAPI run. A no-op when @bh is NULL or
+ * automatic override is disabled (@ovcfg.budget_full_streak == 0).
+ *
+ * Context: Any.
+ */
 void bhm_report_saturated(struct bhm_bh *bh)
 {
 	if (bh)
 		bhm_account_saturated(bh, true);
 }
 
+/**
+ * bhm_report_drained() - Notify the manager the BH caught up.
+ * @bh: BH to update.
+ *
+ * Resets the saturation streak counter. Pairs with
+ * bhm_report_saturated().
+ *
+ * Context: Any.
+ */
 void bhm_report_drained(struct bhm_bh *bh)
 {
 	if (bh)
 		bhm_account_saturated(bh, false);
 }
 
+/**
+ * bhm_force_override() - Latch override on @bh immediately.
+ * @bh: BH to update.
+ *
+ * Schedules a level-callback edge with override = true. If
+ * ovcfg.timeout_ms is non-zero, the override auto-clears after that
+ * many milliseconds.
+ *
+ * Context: Any.
+ */
 void bhm_force_override(struct bhm_bh *bh)
 {
 	unsigned long flags;
@@ -1746,6 +2266,16 @@ void bhm_force_override(struct bhm_bh *bh)
 	spin_unlock_irqrestore(&g_mgr.lock, flags);
 }
 
+/**
+ * bhm_clear_override() - Drop override on @bh immediately.
+ * @bh: BH to update.
+ *
+ * Schedules a level-callback edge with override = false and cancels
+ * any pending auto-clear delayed work. If saturation continues, the
+ * streak detector may re-latch on subsequent polls.
+ *
+ * Context: Any.
+ */
 void bhm_clear_override(struct bhm_bh *bh)
 {
 	unsigned long flags;
@@ -1762,6 +2292,15 @@ void bhm_clear_override(struct bhm_bh *bh)
 		bhm_schedule_dispatch(bh);
 }
 
+/**
+ * bhm_is_override() - Snapshot @bh's override flag.
+ * @bh: BH to read.
+ *
+ * Context: Any.
+ *
+ * Return: True iff override is currently latched. False when @bh is
+ * NULL.
+ */
 bool bhm_is_override(struct bhm_bh *bh)
 {
 	unsigned long flags;
@@ -1775,6 +2314,14 @@ bool bhm_is_override(struct bhm_bh *bh)
 	return r;
 }
 
+/**
+ * bhm_current_level() - Snapshot @bh's currently-active level index.
+ * @bh: BH to read.
+ *
+ * Context: Any.
+ *
+ * Return: Level index, or %BHM_INVALID_LEVEL when @bh is NULL.
+ */
 u32 bhm_current_level(struct bhm_bh *bh)
 {
 	unsigned long flags;
@@ -1788,11 +2335,28 @@ u32 bhm_current_level(struct bhm_bh *bh)
 	return r;
 }
 
+/**
+ * bhm_priv() - Retrieve the caller-supplied priv pointer.
+ * @bh: BH to read.
+ *
+ * Context: Any.
+ *
+ * Return: The @priv passed to bhm_register(); NULL when @bh is NULL.
+ */
 void *bhm_priv(struct bhm_bh *bh)
 {
 	return bh ? bh->priv : NULL;
 }
 
+/**
+ * bhm_get_tput() - Snapshot the global TX/RX aggregates.
+ * @tx_bps: Out: aggregate TX bits/second from the last sampler tick.
+ *          May be NULL.
+ * @rx_bps: Out: aggregate RX bits/second from the last sampler tick.
+ *          May be NULL.
+ *
+ * Context: Any.
+ */
 void bhm_get_tput(u32 *tx_bps, u32 *rx_bps)
 {
 	unsigned long flags;
@@ -1803,6 +2367,18 @@ void bhm_get_tput(u32 *tx_bps, u32 *rx_bps)
 	spin_unlock_irqrestore(&g_mgr.lock, flags);
 }
 
+/**
+ * bhm_get_migration_counters() - Read @bh's migration counters.
+ * @bh: BH to read. NULL is tolerated and produces no write.
+ * @out: Destination filled atomically per field. NULL is tolerated.
+ *
+ * Each field is read with atomic64_read(). Concurrent updates from
+ * the dispatch path do not need to be silenced. THREADED_NAPI and
+ * WORKQUEUE BHs always read zero (those backends do not use IPI
+ * redirect).
+ *
+ * Context: Any.
+ */
 void bhm_get_migration_counters(struct bhm_bh *bh,
 				struct bhm_migration_counters *out)
 {
@@ -1814,11 +2390,29 @@ void bhm_get_migration_counters(struct bhm_bh *bh,
 	out->dispatch_failed = atomic64_read(&bh->mig_dispatch_failed);
 }
 
+/**
+ * bhm_napi_to_bh() - Recover the BH from an embedded napi_struct.
+ * @napi: NAPI pointer received in a poll handler.
+ *
+ * The @napi must belong to a BH registered with %BHM_TYPE_NAPI or
+ * %BHM_TYPE_THREADED_NAPI. Passing an unrelated pointer is undefined
+ * behavior.
+ *
+ * Return: BH handle.
+ */
 struct bhm_bh *bhm_napi_to_bh(struct napi_struct *napi)
 {
 	return container_of(napi, struct bhm_bh, be.napi.napi);
 }
 
+/**
+ * bhm_work_to_bh() - Recover the BH from an embedded work_struct.
+ * @work: work_struct pointer received in a workqueue handler.
+ *
+ * The @work must belong to a BH registered with %BHM_TYPE_WORKQUEUE.
+ *
+ * Return: BH handle.
+ */
 struct bhm_bh *bhm_work_to_bh(struct work_struct *work)
 {
 	return container_of(work, struct bhm_bh, be.work.w);

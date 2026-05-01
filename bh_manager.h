@@ -190,6 +190,18 @@
 
 struct bhm_bh;
 
+/**
+ * enum bhm_type - Backend driving a registered BH.
+ * @BHM_TYPE_WORKQUEUE: Work item dispatched via queue_work() (or
+ *                      queue_work_on() when a preferred CPU is set).
+ * @BHM_TYPE_TASKLET:   Classic tasklet; supports IPI redirection to a
+ *                      preferred CPU at bhm_schedule() time.
+ * @BHM_TYPE_NAPI:      Non-threaded NAPI; supports IPI redirection from
+ *                      the poll wrapper.
+ * @BHM_TYPE_THREADED_NAPI: Threaded NAPI (kthread); preferred-CPU
+ *                      placement uses set_cpus_allowed_ptr() on the
+ *                      kthread instead of IPI.
+ */
 enum bhm_type {
 	BHM_TYPE_WORKQUEUE,
 	BHM_TYPE_TASKLET,
@@ -197,31 +209,53 @@ enum bhm_type {
 	BHM_TYPE_THREADED_NAPI,
 };
 
+/**
+ * enum bhm_tput_dir - Per-level direction filter for threshold matching.
+ * @BHM_DIR_TX:   Compare threshold against TX bps only.
+ * @BHM_DIR_RX:   Compare threshold against RX bps only.
+ * @BHM_DIR_BOTH: Compare threshold against TX + RX (sum).
+ */
 enum bhm_tput_dir {
 	BHM_DIR_TX,
 	BHM_DIR_RX,
 	BHM_DIR_BOTH,
 };
 
-/* Sentinel for bhm_level::threshold_bps.
- * Semantics: the level has no tput threshold; it is always treated as the
- * floor (active only when no higher threshold level matches) and its
- * callback fires every 100ms while active.
- * At most one PERIODIC level per BH, placed at index 0 of levels[].
+/**
+ * DOC: BHM_LEVEL_PERIODIC
+ *
+ * Sentinel value for &struct bhm_level.threshold_bps.
+ *
+ * The level has no tput threshold; it is treated as the floor (active only
+ * when no higher threshold matches) and its callback fires every 100 ms
+ * while active. At most one PERIODIC level per BH, and it must be at index
+ * 0 of the levels[] array.
  */
 #define BHM_LEVEL_PERIODIC  ((u32)-1)
 
-/* Callback invocation contract:
- *   - Called from a dedicated manager workqueue (sleepable).
- *   - Invoked on (a) transition INTO this level, (b) override edge while
- *     this level is active, (c) every 100ms tick if this level is PERIODIC
- *     and currently active.
- *   - (a) and (b) use net-change semantics: the callback fires only when
- *     the delivered state differs from what the consumer was last told.
- *     A burst that nets to no change (e.g. off→on→off within one dispatch
- *     cycle) produces no callback. Periodic ticks (c) always pass through.
- *   - avail_cpus points to an internal snapshot; copy with cpumask_copy()
- *     if the callback needs to retain it beyond the call.
+/**
+ * typedef bhm_level_cb - Per-level user callback signature.
+ * @bh: BH handle returned by bhm_register().
+ * @level_idx: Index of the level whose threshold is currently matched.
+ * @tput_tx_bps: Aggregated TX bits/second across this BH's filter.
+ * @tput_rx_bps: Aggregated RX bits/second across this BH's filter.
+ * @override: True when the BH is currently in override (saturation
+ *            streak / forced / pending timeout).
+ * @avail_cpus: Snapshot of currently-online CPUs. Internal storage —
+ *              copy with cpumask_copy() if the callback needs to retain
+ *              it beyond the call.
+ * @ctx: Opaque pointer copied from &struct bhm_level.ctx.
+ *
+ * Invocation contract:
+ *
+ *  - Called from a dedicated manager workqueue (sleepable context).
+ *  - Invoked on (a) transition INTO this level, (b) override edge while
+ *    this level is active, (c) every 100 ms tick if this level is
+ *    PERIODIC and currently active.
+ *  - (a) and (b) use net-change semantics: the callback fires only when
+ *    the delivered state differs from what the consumer was last told.
+ *    A burst that nets to no change (e.g. off→on→off within one dispatch
+ *    cycle) produces no callback. Periodic ticks (c) always pass through.
  */
 typedef void (*bhm_level_cb)(struct bhm_bh *bh,
 				 u32 level_idx,
@@ -231,80 +265,120 @@ typedef void (*bhm_level_cb)(struct bhm_bh *bh,
 				 const cpumask_t *avail_cpus,
 				 void *ctx);
 
+/**
+ * struct bhm_level - One level definition within a BH.
+ * @threshold_bps: Threshold in bits/second, or %BHM_LEVEL_PERIODIC for
+ *                 the floor periodic level (allowed only at index 0).
+ * @dir: Which direction to compare against @threshold_bps.
+ * @cb: Callback invoked on entry, override edge, and (if PERIODIC) tick.
+ * @ctx: Opaque context passed back to @cb.
+ */
 struct bhm_level {
-	u32                   threshold_bps;   /* BHM_LEVEL_PERIODIC or bps */
+	u32                   threshold_bps;
 	enum bhm_tput_dir    dir;
 	bhm_level_cb      cb;
 	void                 *ctx;
 };
 
+/**
+ * struct bhm_hysteresis - Tick counts required to confirm a level transition.
+ * @rise_ticks: Consecutive 100 ms ticks that must agree with a higher
+ *              candidate level before a transition fires. 0 = use module
+ *              default.
+ * @fall_ticks: Consecutive 100 ms ticks that must agree with a lower
+ *              candidate level before a transition fires. 0 = use module
+ *              default.
+ */
 struct bhm_hysteresis {
-	u32 rise_ticks;   /* ticks required to confirm an upward transition  */
-	u32 fall_ticks;   /* ticks required to confirm a downward transition */
+	u32 rise_ticks;
+	u32 fall_ticks;
 };
 
+/**
+ * struct bhm_override_cfg - Override (saturation) auto-control parameters.
+ * @budget_full_streak: Consecutive full-budget NAPI runs (or explicit
+ *                      bhm_report_saturated() calls) required to latch
+ *                      override. 0 disables automatic override.
+ * @timeout_ms: Auto-clear override after this many milliseconds.
+ *              0 means manual clear only (via bhm_clear_override()).
+ */
 struct bhm_override_cfg {
-	/* Consecutive full-budget NAPI runs (or explicit saturated reports)
-	 * required to latch override. 0 disables automatic override.
-	 */
 	u32 budget_full_streak;
-
-	/* Auto-clear override after this many milliseconds.
-	 * 0 means no auto-clear (manual only via bhm_clear_override()).
-	 */
 	u32 timeout_ms;
 };
 
+/**
+ * struct bhm_napi_params - Backend parameters for NAPI / THREADED_NAPI BHs.
+ * @poll: User poll function. Wrapped internally so the manager can run
+ *        accounting and (for non-threaded) IPI redirection.
+ * @weight: NAPI weight passed through to netif_napi_add_weight().
+ * @dev: Anchor netdev for netif_napi_add(). NULL is allowed for
+ *       %BHM_TYPE_NAPI (the manager's dummy netdev is substituted) but
+ *       mandatory for %BHM_TYPE_THREADED_NAPI (dev_set_threaded()
+ *       requires a real dev). The dev must outlive the BH.
+ */
 struct bhm_napi_params {
 	int                (*poll)(struct napi_struct *napi, int budget);
 	int                  weight;
-	/* Optional. If NULL, the manager's internal dummy netdev is used.
-	 * Mandatory for BHM_TYPE_THREADED_NAPI (dev->threaded is set).
-	 */
 	struct net_device   *dev;
 };
 
+/**
+ * struct bhm_tasklet_params - Backend parameters for TASKLET BHs.
+ * @fn: User tasklet handler.
+ * @data: Caller-supplied opaque value passed to @fn.
+ */
 struct bhm_tasklet_params {
 	void           (*fn)(unsigned long data);
 	unsigned long    data;
 };
 
+/**
+ * struct bhm_workqueue_params - Backend parameters for WORKQUEUE BHs.
+ * @fn: User work handler.
+ * @wq: Workqueue to dispatch on, or NULL to use system_wq.
+ */
 struct bhm_workqueue_params {
 	void                      (*fn)(struct work_struct *work);
-	struct workqueue_struct   *wq;     /* NULL → system_wq */
+	struct workqueue_struct   *wq;
 };
 
+/**
+ * struct bhm_params - Aggregate registration parameters for bhm_register().
+ * @type: Backend type; selects which @u member is read.
+ * @u: Backend-specific parameters.
+ * @u.napi: Used when @type is %BHM_TYPE_NAPI or %BHM_TYPE_THREADED_NAPI.
+ * @u.tasklet: Used when @type is %BHM_TYPE_TASKLET.
+ * @u.work: Used when @type is %BHM_TYPE_WORKQUEUE.
+ * @levels: Array of level definitions, ascending by threshold_bps. A
+ *          PERIODIC level, if present, must be at index 0.
+ * @nr_levels: Number of entries in @levels.
+ * @hyst: Hysteresis tick counts.
+ * @override: Override / saturation configuration.
+ * @netdev_names: Optional NULL-terminated array of interface names whose
+ *                aggregated throughput drives this BH's level selection
+ *                and the (tx, rx) values reported to the callback.
+ *                NULL means "all registered netdevs" (global aggregate).
+ *                An empty array ({ NULL }) is rejected — use NULL.
+ *                The pointer and the strings must outlive the BH.
+ *                Names longer than IFNAMSIZ-1 are rejected at
+ *                registration.
+ */
 struct bhm_params {
 	enum bhm_type type;
 
 	union {
-		struct bhm_napi_params       napi;     /* NAPI / THREADED_NAPI */
+		struct bhm_napi_params       napi;
 		struct bhm_tasklet_params    tasklet;
 		struct bhm_workqueue_params  work;
 	} u;
 
-	/* Levels must be ascending by threshold_bps. A PERIODIC level, if
-	 * present, must be at index 0.
-	 */
 	const struct bhm_level      *levels;
 	u32                              nr_levels;
 
 	struct bhm_hysteresis        hyst;
 	struct bhm_override_cfg      override;
 
-	/* Optional: NULL-terminated array of netdev interface names whose
-	 * aggregated throughput drives this BH's level selection and the
-	 * tput values reported to the callback.
-	 *
-	 *   NULL (default) → sum across ALL registered netdevs.
-	 *   { "wlan0", NULL }            → watch wlan0 only.
-	 *   { "wlan0", "wlan1", NULL }   → watch both interfaces.
-	 *
-	 * An empty array ({ NULL }) is rejected — use NULL to mean "all".
-	 * The pointer and the strings must outlive the BH (string literals
-	 * or static storage are the common choice). Names longer than
-	 * IFNAMSIZ-1 are rejected at registration.
-	 */
 	const char * const          *netdev_names;
 };
 
@@ -478,6 +552,16 @@ void bhm_get_tput(u32 *tx_bps, u32 *rx_bps);
  *
  * Counters are atomic snapshots — read concurrently with the BH running
  * is fine. They are zeroed at bhm_register() and never reset thereafter.
+ */
+
+/**
+ * struct bhm_migration_counters - Snapshot of NAPI/TASKLET migration outcomes.
+ * @attempts: Times the dispatch site decided to migrate.
+ * @complete_missed: NAPI ONLY. napi_complete_done() returned false; IPI
+ *                   was deliberately suppressed.
+ * @dispatched: Times ipi_send to the target CPU succeeded.
+ * @dispatch_failed: Times ipi_send failed (e.g. target raced offline);
+ *                   the dispatcher fell back to a local kick.
  */
 struct bhm_migration_counters {
 	u64 attempts;
