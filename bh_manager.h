@@ -411,6 +411,49 @@ void *bhm_priv(struct bhm_bh *bh);
 /* Snapshot aggregated tput (bps) across all registered netdevs. */
 void bhm_get_tput(u32 *tx_bps, u32 *rx_bps);
 
+/* ---------- Migration counters (NAPI redirect path) ----------
+ *
+ * The NAPI poll wrapper redirects polling to bh->preferred_mask via
+ * smp_call_function_single_async() (an IPI carrying napi_schedule on the
+ * target CPU). Several outcomes are possible per attempt:
+ *
+ *   attempts        : poll wrapper entered the migration branch
+ *                     (bhm_should_use_ipi() returned true).
+ *
+ *   complete_missed : napi_complete_done() returned false because MISSED
+ *                     was already set on entry; the NAPI is now
+ *                     re-scheduled locally and the IPI was deliberately
+ *                     suppressed (firing it would have set MISSED on the
+ *                     target with no effect).
+ *
+ *   dispatched      : ipi_send to the target CPU succeeded; the target
+ *                     should pick up polling on its softirq.
+ *
+ *   dispatch_failed : ipi_send failed (e.g. target CPU raced offline);
+ *                     the wrapper re-kicked locally as a fallback.
+ *
+ * In an ideal run, attempts == complete_missed + dispatched +
+ * dispatch_failed. If "attempts" outpaces the sum, an in-window IRQ
+ * defeated the migration: a fresh IRQ on the source CPU between
+ * napi_complete_done() and ipi_send() set SCHED locally, and the
+ * subsequent IPI's napi_schedule() on the target only set MISSED.
+ * The local poll then runs again and migration is retried. This race
+ * is fundamental to building migration on top of NAPI primitives without
+ * touching the driver's IRQ path; see the comment in bhm_napi_poll_wrapper.
+ *
+ * Counters are atomic snapshots — read concurrently with the BH running
+ * is fine. They are zeroed at bhm_register() and never reset thereafter.
+ */
+struct bhm_migration_counters {
+	u64 attempts;
+	u64 complete_missed;
+	u64 dispatched;
+	u64 dispatch_failed;
+};
+
+void bhm_get_migration_counters(struct bhm_bh *bh,
+				struct bhm_migration_counters *out);
+
 /* ---------- Backend-to-BH accessors ----------
  *
  * Recover the BH handle from the underlying backend object inside user

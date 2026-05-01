@@ -44,9 +44,37 @@
 #define BHM_DEFAULT_RISE_TICKS       1
 #define BHM_DEFAULT_FALL_TICKS       10
 #define BHM_INVALID_LEVEL            ((u32)-1)
+#define BHM_CSD_DRAIN_TIMEOUT_MS     100
 
-/* timer_delete_sync() replaced del_timer_sync() in kernel v6.15. */
-#if KERNEL_VERSION(6, 15, 0) <= LINUX_VERSION_CODE
+/* -------------------------------------------------------------------------
+ * Kernel-version capability flags
+ *
+ * Centralized so version dependencies live in one place. Each flag maps to
+ * a specific upstream API change; the comments record the corresponding
+ * commit/rename for the next time someone looks at this file.
+ * ---------------------------------------------------------------------- */
+
+/* v4.15: setup_timer() → timer_setup() / from_timer(); timer_list callback
+ * argument changed from `unsigned long` to `struct timer_list *`. */
+#define BHM_HAS_TIMER_SETUP            (KERNEL_VERSION(4, 15, 0) <= LINUX_VERSION_CODE)
+
+/* v6.1: netif_napi_add() lost its weight argument; new
+ * netif_napi_add_weight() carries it explicitly. */
+#define BHM_HAS_NETIF_NAPI_ADD_WEIGHT  (KERNEL_VERSION(6,  1, 0) <= LINUX_VERSION_CODE)
+
+/* v6.11: init_dummy_netdev() (in-place init) replaced by
+ * alloc_netdev_dummy() + free_netdev(). */
+#define BHM_HAS_ALLOC_NETDEV_DUMMY     (KERNEL_VERSION(6, 11, 0) <= LINUX_VERSION_CODE)
+
+/* v6.15: del_timer_sync() renamed timer_delete_sync(). */
+#define BHM_HAS_TIMER_DELETE_SYNC      (KERNEL_VERSION(6, 15, 0) <= LINUX_VERSION_CODE)
+
+/* v6.16: from_timer() renamed timer_container_of(); dev_set_threaded()
+ * second argument changed from bool to enum netdev_napi_threaded. */
+#define BHM_HAS_TIMER_CONTAINER_OF     (KERNEL_VERSION(6, 16, 0) <= LINUX_VERSION_CODE)
+#define BHM_HAS_DEV_SET_THREADED_ENUM  (KERNEL_VERSION(6, 16, 0) <= LINUX_VERSION_CODE)
+
+#if BHM_HAS_TIMER_DELETE_SYNC
 #define bhm_timer_delete_sync(t)  timer_delete_sync(t)
 #else
 #define bhm_timer_delete_sync(t)  del_timer_sync(t)
@@ -105,6 +133,21 @@ struct bhm_bh {
 	 * pointees are caller-owned and must outlive the BH.
 	 */
 	const char * const      *netdev_names;
+
+	/* Resolved cache for `netdev_names`. Parallel array sized
+	 * `filter_count`; each slot holds the bhm_netdev whose dev->name
+	 * matches netdev_names[i], or NULL if no such netdev is currently
+	 * registered. Maintained under g_mgr.lock at BH register time and
+	 * on every bhm_register_netdev / bhm_unregister_netdev so the
+	 * 100ms hot path can sum filtered throughput in O(filter_count)
+	 * instead of O(filter_count × |netdev_list|). NULL when
+	 * netdev_names is NULL (global aggregate).
+	 *
+	 * Note: cache is keyed by name at the moment of (un)register;
+	 * runtime renames (NETDEV_CHANGENAME) are not tracked.
+	 */
+	struct bhm_netdev      **resolved_devs;
+	unsigned int             filter_count;
 
 	/* Preferred-CPU dispatch.
 	 *   per_cpu:        dynamic per-CPU IPI slots (alloc_percpu).
@@ -177,6 +220,15 @@ struct bhm_bh {
 			void                   (*user_fn)(struct work_struct *);
 		} work;
 	} be;
+
+	/* Migration outcome counters (NAPI redirect path). See
+	 * bhm_napi_poll_wrapper for definitions of each event. atomic64 so
+	 * concurrent readers (bhm_get_migration_counters) need no lock.
+	 */
+	atomic64_t               mig_attempts;
+	atomic64_t               mig_complete_missed;
+	atomic64_t               mig_dispatched;
+	atomic64_t               mig_dispatch_failed;
 };
 
 struct bhm_mgr {
@@ -199,7 +251,7 @@ struct bhm_mgr {
 	 * from the fallback storage below.
 	 */
 	struct net_device *dummy_dev;
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
+#if !BHM_HAS_ALLOC_NETDEV_DUMMY
 	struct net_device dummy_dev_storage;
 #endif
 
@@ -264,6 +316,7 @@ static void bhm_schedule_dispatch(struct bhm_bh *bh)
 static void bhm_latch_event(struct bhm_bh *bh, u32 evt_bit, u32 level,
 			   u32 tx, u32 rx, bool override_state)
 {
+	lockdep_assert_held(&g_mgr.lock);
 	bh->pending_evt      |= evt_bit;
 	bh->pending_level     = level;
 	bh->pending_tput_tx   = tx;
@@ -335,23 +388,36 @@ static void bhm_dispatch_work_fn(struct work_struct *w)
  * Override auto-clear work
  * ---------------------------------------------------------------------- */
 
+/* Returns true iff override was on and got cleared (caller should
+ * bhm_schedule_dispatch outside the lock to deliver the edge). Caller must
+ * hold g_mgr.lock.
+ */
+static bool bhm_clear_override_locked(struct bhm_bh *bh)
+{
+	u32 tx, rx;
+
+	lockdep_assert_held(&g_mgr.lock);
+
+	if (!bh->override_on)
+		return false;
+
+	bh->override_on = false;
+	bh->sat_streak  = 0;
+	bhm_bh_tput_locked(bh, &tx, &rx);
+	bhm_latch_event(bh, BHM_EVT_OVERRIDE_EDGE, bh->current_level,
+			tx, rx, false);
+	return true;
+}
+
 static void bhm_override_clear_work_fn(struct work_struct *w)
 {
 	struct delayed_work *dw = to_delayed_work(w);
 	struct bhm_bh *bh = container_of(dw, struct bhm_bh, override_clear_work);
 	unsigned long flags;
-	bool fire = false;
-	u32 tx, rx, level;
+	bool fire;
 
 	spin_lock_irqsave(&g_mgr.lock, flags);
-	if (bh->override_on) {
-		bh->override_on = false;
-		bh->sat_streak  = 0;
-		bhm_bh_tput_locked(bh, &tx, &rx);
-		level = bh->current_level;
-		bhm_latch_event(bh, BHM_EVT_OVERRIDE_EDGE, level, tx, rx, false);
-		fire = true;
-	}
+	fire = bhm_clear_override_locked(bh);
 	spin_unlock_irqrestore(&g_mgr.lock, flags);
 
 	if (fire)
@@ -361,6 +427,8 @@ static void bhm_override_clear_work_fn(struct work_struct *w)
 static void bhm_trigger_override_locked(struct bhm_bh *bh)
 {
 	u32 tx, rx;
+
+	lockdep_assert_held(&g_mgr.lock);
 
 	if (bh->override_on)
 		return;
@@ -478,19 +546,46 @@ static int bhm_napi_poll_wrapper(struct napi_struct *napi, int budget)
 	int work_done;
 
 	if (bhm_should_use_ipi(bh, &preferred)) {
-		/* Order matters:
-		 *   napi_complete_done MUST run BEFORE we issue the IPI so
-		 *   the target CPU's napi_schedule() sees a cleared SCHED
-		 *   bit. If we issued the IPI first and the CSD fired on
-		 *   the target CPU while our NAPI was still in SCHED state,
-		 *   napi_schedule would only set MISSED, and our subsequent
-		 *   napi_complete_done would re-kick the NAPI *locally* —
-		 *   defeating the migration.
+		/* Migration race notes — three orderings to be aware of:
+		 *
+		 * 1. napi_complete_done MUST precede the IPI. If we issued
+		 *    the IPI first while SCHED is still set on this CPU, the
+		 *    target's napi_schedule() would only set MISSED (no
+		 *    queue) and our subsequent napi_complete_done would
+		 *    re-kick the NAPI *locally*, defeating the migration.
+		 *
+		 * 2. napi_complete_done returns false when MISSED was
+		 *    already set entering this poll: the helper has now
+		 *    re-scheduled the NAPI *locally* itself. Issuing the IPI
+		 *    in that state is pure noise — it would only flip MISSED
+		 *    on the target with no effect — so we bail and let the
+		 *    local re-schedule run. Counted as mig_complete_missed.
+		 *
+		 * 3. The window between napi_complete_done and bhm_ipi_send
+		 *    is unprotected: a fresh IRQ on this CPU here will
+		 *    napi_schedule() locally, after which the IPI's
+		 *    napi_schedule() on the target only sets MISSED. The
+		 *    local poll then runs again and migration is retried on
+		 *    the next iteration. This race is fundamental to
+		 *    building migration on top of NAPI primitives without
+		 *    touching the driver's IRQ path. It is not directly
+		 *    counted; it shows up as mig_attempts outpacing
+		 *    (mig_complete_missed + mig_dispatched +
+		 *    mig_dispatch_failed).
 		 */
-		napi_complete_done(napi, 0);
-		if (bhm_ipi_send(bh, preferred) != 0) {
+		atomic64_inc(&bh->mig_attempts);
+
+		if (!napi_complete_done(napi, 0)) {
+			atomic64_inc(&bh->mig_complete_missed);
+			return 0;
+		}
+
+		if (bhm_ipi_send(bh, preferred) == 0) {
+			atomic64_inc(&bh->mig_dispatched);
+		} else {
 			/* Dispatch failed (CPU raced offline, etc.). Re-kick
 			 * locally so the BH doesn't stall. */
+			atomic64_inc(&bh->mig_dispatch_failed);
 			napi_schedule(napi);
 		}
 		return 0;
@@ -527,6 +622,8 @@ static void bhm_sample_tput_locked(u32 *global_tx_bps, u32 *global_rx_bps)
 	struct rtnl_link_stats64 s;
 	ktime_t now = ktime_get();
 	u64 sum_tx_bps = 0, sum_rx_bps = 0;
+
+	lockdep_assert_held(&g_mgr.lock);
 
 	list_for_each_entry(e, &g_mgr.netdev_list, node) {
 		s64 dt_ns;
@@ -579,40 +676,150 @@ static void bhm_sample_tput_locked(u32 *global_tx_bps, u32 *global_rx_bps)
 
 /* Compute @bh's filtered throughput aggregate. Caller must hold g_mgr.lock.
  * NULL filter → global aggregate (precomputed by bhm_sample_tput_locked).
+ * Otherwise sums over the resolved-netdev cache, which is kept in sync by
+ * bhm_register_netdev / bhm_unregister_netdev / bhm_register.
  */
 static void bhm_bh_tput_locked(const struct bhm_bh *bh,
 				u32 *tx_bps, u32 *rx_bps)
 {
-	struct bhm_netdev *e;
 	u64 sum_tx = 0, sum_rx = 0;
-	const char * const *names = bh->netdev_names;
+	unsigned int i;
 
-	if (!names) {
+	lockdep_assert_held(&g_mgr.lock);
+
+	if (!bh->netdev_names) {
 		*tx_bps = g_mgr.last_tput_tx;
 		*rx_bps = g_mgr.last_tput_rx;
 		return;
 	}
 
-	list_for_each_entry(e, &g_mgr.netdev_list, node) {
-		const char * const *n;
+	for (i = 0; i < bh->filter_count; i++) {
+		struct bhm_netdev *e = bh->resolved_devs[i];
 
-		for (n = names; *n; n++) {
-			if (strcmp(*n, e->dev->name) == 0) {
-				sum_tx += e->tx_bps;
-				sum_rx += e->rx_bps;
-				break;
-			}
-		}
+		if (!e)
+			continue;
+		sum_tx += e->tx_bps;
+		sum_rx += e->rx_bps;
 	}
 
 	*tx_bps = (sum_tx > U32_MAX) ? U32_MAX : (u32)sum_tx;
 	*rx_bps = (sum_rx > U32_MAX) ? U32_MAX : (u32)sum_rx;
 }
 
+/* Find the bhm_netdev for `name` in g_mgr.netdev_list, or NULL.
+ * Caller must hold g_mgr.lock.
+ */
+static struct bhm_netdev *bhm_find_netdev_by_name_locked(const char *name)
+{
+	struct bhm_netdev *e;
+
+	lockdep_assert_held(&g_mgr.lock);
+
+	list_for_each_entry(e, &g_mgr.netdev_list, node) {
+		if (strcmp(e->dev->name, name) == 0)
+			return e;
+	}
+	return NULL;
+}
+
+/* Populate bh->resolved_devs from the current g_mgr.netdev_list.
+ * Caller must hold g_mgr.lock.
+ *
+ * If the caller's filter names the same netdev twice, only the first slot
+ * holds the pointer; later duplicates stay NULL. This matches the previous
+ * strcmp-based aggregation, which iterated each netdev once and broke on
+ * the first matching name (so a netdev was counted at most once per BH).
+ */
+static void bhm_resolve_filter_locked(struct bhm_bh *bh)
+{
+	unsigned int i;
+
+	lockdep_assert_held(&g_mgr.lock);
+
+	if (!bh->netdev_names || !bh->resolved_devs)
+		return;
+	for (i = 0; i < bh->filter_count; i++) {
+		struct bhm_netdev *e =
+			bhm_find_netdev_by_name_locked(bh->netdev_names[i]);
+		unsigned int j;
+
+		if (e) {
+			for (j = 0; j < i; j++) {
+				if (bh->resolved_devs[j] == e) {
+					e = NULL;   /* dedupe */
+					break;
+				}
+			}
+		}
+		bh->resolved_devs[i] = e;
+	}
+}
+
+/* For each registered BH, fill in the first NULL resolved-cache slot whose
+ * name matches @e->dev->name (skipping BHs that already have @e linked).
+ * Caller must hold g_mgr.lock.
+ */
+static void bhm_resolve_link_netdev_locked(struct bhm_netdev *e)
+{
+	struct bhm_bh *bh;
+	const char *name = e->dev->name;
+
+	lockdep_assert_held(&g_mgr.lock);
+
+	list_for_each_entry(bh, &g_mgr.bh_list, node) {
+		unsigned int i;
+		bool already_linked = false;
+
+		if (!bh->netdev_names || !bh->resolved_devs)
+			continue;
+
+		for (i = 0; i < bh->filter_count; i++) {
+			if (bh->resolved_devs[i] == e) {
+				already_linked = true;
+				break;
+			}
+		}
+		if (already_linked)
+			continue;
+
+		for (i = 0; i < bh->filter_count; i++) {
+			if (bh->resolved_devs[i])
+				continue;
+			if (strcmp(bh->netdev_names[i], name) == 0) {
+				bh->resolved_devs[i] = e;
+				break;   /* dedupe: link only the first match */
+			}
+		}
+	}
+}
+
+/* For each registered BH, NULL out any resolved-cache slot pointing to @e.
+ * Caller must hold g_mgr.lock.
+ */
+static void bhm_resolve_unlink_netdev_locked(struct bhm_netdev *e)
+{
+	struct bhm_bh *bh;
+
+	lockdep_assert_held(&g_mgr.lock);
+
+	list_for_each_entry(bh, &g_mgr.bh_list, node) {
+		unsigned int i;
+
+		if (!bh->resolved_devs)
+			continue;
+		for (i = 0; i < bh->filter_count; i++) {
+			if (bh->resolved_devs[i] == e)
+				bh->resolved_devs[i] = NULL;
+		}
+	}
+}
+
 static void bhm_evaluate_bh_locked(struct bhm_bh *bh)
 {
 	u32 tx, rx, selected;
 	u32 evt = 0;
+
+	lockdep_assert_held(&g_mgr.lock);
 
 	bhm_bh_tput_locked(bh, &tx, &rx);
 	selected = bhm_select_level(bh, tx, rx);
@@ -644,15 +851,15 @@ static void bhm_evaluate_bh_locked(struct bhm_bh *bh)
 	}
 }
 
-#if KERNEL_VERSION(4, 15, 0) <= LINUX_VERSION_CODE
+#if BHM_HAS_TIMER_SETUP
 static void bhm_timer_fn(struct timer_list *t)
 #else
 static void bhm_timer_fn(unsigned long data)
 #endif
 {
-#if KERNEL_VERSION(6, 16, 0) <= LINUX_VERSION_CODE
+#if BHM_HAS_TIMER_CONTAINER_OF
 	struct bhm_mgr *mgr = timer_container_of(mgr, t, timer);
-#elif KERNEL_VERSION(4, 15, 0) <= LINUX_VERSION_CODE
+#elif BHM_HAS_TIMER_SETUP
 	struct bhm_mgr *mgr = from_timer(mgr, t, timer);
 #else
 	struct bhm_mgr *mgr = (struct bhm_mgr *)data;
@@ -678,6 +885,8 @@ static void bhm_timer_fn(unsigned long data)
 
 static void bhm_arm_timer_if_needed_locked(void)
 {
+	lockdep_assert_held(&g_mgr.lock);
+
 	if (g_mgr.timer_armed)
 		return;
 	if (list_empty(&g_mgr.bh_list))
@@ -765,6 +974,7 @@ int bhm_register_netdev(struct net_device *dev)
 		}
 	}
 	list_add_tail(&new_entry->node, &g_mgr.netdev_list);
+	bhm_resolve_link_netdev_locked(new_entry);
 	bhm_arm_timer_if_needed_locked();
 	spin_unlock_irqrestore(&g_mgr.lock, flags);
 
@@ -782,6 +992,7 @@ int bhm_unregister_netdev(struct net_device *dev)
 	spin_lock_irqsave(&g_mgr.lock, flags);
 	list_for_each_entry_safe(e, tmp, &g_mgr.netdev_list, node) {
 		if (e->dev == dev) {
+			bhm_resolve_unlink_netdev_locked(e);
 			list_del(&e->node);
 			found = e;
 			break;
@@ -818,13 +1029,13 @@ int bhm_init(void)
 	if (!g_mgr.wq)
 		return -ENOMEM;
 
-#if KERNEL_VERSION(4, 15, 0) <= LINUX_VERSION_CODE
+#if BHM_HAS_TIMER_SETUP
 	timer_setup(&g_mgr.timer, bhm_timer_fn, 0);
 #else
 	setup_timer(&g_mgr.timer, bhm_timer_fn, (unsigned long)&g_mgr);
 #endif
 
-#if KERNEL_VERSION(6, 11, 0) <= LINUX_VERSION_CODE
+#if BHM_HAS_ALLOC_NETDEV_DUMMY
 	g_mgr.dummy_dev = alloc_netdev_dummy(0);
 	if (!g_mgr.dummy_dev) {
 		destroy_workqueue(g_mgr.wq);
@@ -838,7 +1049,7 @@ int bhm_init(void)
 
 	ret = bhm_cpuhp_register();
 	if (ret < 0) {
-#if KERNEL_VERSION(6, 11, 0) <= LINUX_VERSION_CODE
+#if BHM_HAS_ALLOC_NETDEV_DUMMY
 		free_netdev(g_mgr.dummy_dev);
 		g_mgr.dummy_dev = NULL;
 #endif
@@ -877,7 +1088,7 @@ void bhm_deinit(void)
 	}
 	spin_unlock_irqrestore(&g_mgr.lock, flags);
 
-#if KERNEL_VERSION(6, 11, 0) <= LINUX_VERSION_CODE
+#if BHM_HAS_ALLOC_NETDEV_DUMMY
 	if (g_mgr.dummy_dev) {
 		free_netdev(g_mgr.dummy_dev);
 		g_mgr.dummy_dev = NULL;
@@ -998,7 +1209,7 @@ static int bhm_bh_backend_init(struct bhm_bh *bh,
 				return ret;
 		}
 
-#if KERNEL_VERSION(6, 1, 0) <= LINUX_VERSION_CODE
+#if BHM_HAS_NETIF_NAPI_ADD_WEIGHT
 		netif_napi_add_weight(dev, &bh->be.napi.napi,
 				      bhm_napi_poll_wrapper, p->u.napi.weight);
 #else
@@ -1009,7 +1220,7 @@ static int bhm_bh_backend_init(struct bhm_bh *bh,
 		bh->be.napi.added = true;
 
 		if (bh->be.napi.threaded) {
-#if KERNEL_VERSION(6, 16, 0) <= LINUX_VERSION_CODE
+#if BHM_HAS_DEV_SET_THREADED_ENUM
 			dev_set_threaded(dev, NETDEV_NAPI_THREADED_ENABLED);
 #else
 			dev_set_threaded(dev, true);
@@ -1046,6 +1257,7 @@ static int bhm_bh_backend_init(struct bhm_bh *bh,
 static void bhm_drain_pending_csds(struct bhm_bh *bh)
 {
 	int cpu;
+	unsigned long deadline;
 
 	if (!bh->per_cpu)
 		return;
@@ -1053,12 +1265,27 @@ static void bhm_drain_pending_csds(struct bhm_bh *bh)
 	/* A CSD in flight will set `queued=1` until bhm_csd_fn clears it as
 	 * its last operation. Busy-wait briefly until every slot drains so
 	 * we don't free the bh while a CSD still dereferences it.
+	 *
+	 * Bound the wait: if a slot stays stuck (e.g. the target CPU raced
+	 * offline after smp_call_function_single_async() returned 0 but
+	 * before the CSD fired), an unbounded spin would deadlock teardown.
+	 * On timeout we WARN and proceed; this matches the prior behavior
+	 * w.r.t. UAF risk (no worse than the original unbounded spin which
+	 * also could not recover) but no longer hangs the caller.
 	 */
+	deadline = jiffies + msecs_to_jiffies(BHM_CSD_DRAIN_TIMEOUT_MS);
 	for_each_possible_cpu(cpu) {
 		struct bhm_per_cpu *pc = per_cpu_ptr(bh->per_cpu, cpu);
 
-		while (test_bit(0, &pc->queued))
+		while (test_bit(0, &pc->queued)) {
+			if (time_after(jiffies, deadline)) {
+				WARN_ONCE(1,
+					  "bh_manager: CSD drain timeout on cpu%d (online=%d); pending slot left set\n",
+					  cpu, cpu_online(cpu));
+				return;
+			}
 			cpu_relax();
+		}
 	}
 }
 
@@ -1132,11 +1359,27 @@ struct bhm_bh *bhm_register(const struct bhm_params *params,
 	bh->candidate_ticks = 0;
 	cpumask_clear(&bh->preferred_mask);
 
+	if (bh->netdev_names) {
+		const char * const *p;
+
+		for (p = bh->netdev_names; *p; p++)
+			bh->filter_count++;
+		bh->resolved_devs = kcalloc(bh->filter_count,
+					    sizeof(*bh->resolved_devs),
+					    GFP_KERNEL);
+		if (!bh->resolved_devs) {
+			kfree(bh->levels);
+			kfree(bh);
+			return ERR_PTR(-ENOMEM);
+		}
+	}
+
 	INIT_WORK(&bh->dispatch_work, bhm_dispatch_work_fn);
 	INIT_DELAYED_WORK(&bh->override_clear_work, bhm_override_clear_work_fn);
 
 	ret = bhm_bh_backend_init(bh, params);
 	if (ret) {
+		kfree(bh->resolved_devs);
 		kfree(bh->levels);
 		kfree(bh);
 		return ERR_PTR(ret);
@@ -1144,6 +1387,7 @@ struct bhm_bh *bhm_register(const struct bhm_params *params,
 
 	spin_lock_irqsave(&g_mgr.lock, flags);
 	list_add_tail(&bh->node, &g_mgr.bh_list);
+	bhm_resolve_filter_locked(bh);
 	bhm_arm_timer_if_needed_locked();
 	spin_unlock_irqrestore(&g_mgr.lock, flags);
 
@@ -1173,6 +1417,7 @@ int bhm_unregister(struct bhm_bh *bh)
 
 	bhm_bh_backend_deinit(bh);
 
+	kfree(bh->resolved_devs);
 	kfree(bh->levels);
 	kfree(bh);
 	return 0;
@@ -1369,21 +1614,12 @@ void bhm_force_override(struct bhm_bh *bh)
 void bhm_clear_override(struct bhm_bh *bh)
 {
 	unsigned long flags;
-	bool fire = false;
+	bool fire;
 
 	if (!bh)
 		return;
 	spin_lock_irqsave(&g_mgr.lock, flags);
-	if (bh->override_on) {
-		u32 tx, rx;
-
-		bh->override_on = false;
-		bh->sat_streak  = 0;
-		bhm_bh_tput_locked(bh, &tx, &rx);
-		bhm_latch_event(bh, BHM_EVT_OVERRIDE_EDGE, bh->current_level,
-			       tx, rx, false);
-		fire = true;
-	}
+	fire = bhm_clear_override_locked(bh);
 	spin_unlock_irqrestore(&g_mgr.lock, flags);
 
 	cancel_delayed_work(&bh->override_clear_work);
@@ -1430,6 +1666,17 @@ void bhm_get_tput(u32 *tx_bps, u32 *rx_bps)
 	if (tx_bps) *tx_bps = g_mgr.last_tput_tx;
 	if (rx_bps) *rx_bps = g_mgr.last_tput_rx;
 	spin_unlock_irqrestore(&g_mgr.lock, flags);
+}
+
+void bhm_get_migration_counters(struct bhm_bh *bh,
+				struct bhm_migration_counters *out)
+{
+	if (!bh || !out)
+		return;
+	out->attempts        = atomic64_read(&bh->mig_attempts);
+	out->complete_missed = atomic64_read(&bh->mig_complete_missed);
+	out->dispatched      = atomic64_read(&bh->mig_dispatched);
+	out->dispatch_failed = atomic64_read(&bh->mig_dispatch_failed);
 }
 
 struct bhm_bh *bhm_napi_to_bh(struct napi_struct *napi)
